@@ -33,6 +33,14 @@ let sherpaModule: any = null;
 let sherpaInitialized = false;
 let sherpaError: string | null = null;
 
+/**
+ * Promise cache for in-flight initialization. Concurrent callers (e.g. one
+ * voice command and one settings-panel diagnostic firing within the same
+ * tick) all await the same promise instead of each running platform checks
+ * and dynamically importing the native module independently.
+ */
+let initPromise: Promise<boolean> | null = null;
+
 /** Cached recognizer for the currently loaded model + language */
 let cachedRecognizer: { modelId: string; language: string; recognizer: SherpaRecognizer } | null = null;
 
@@ -45,12 +53,25 @@ let cachedRecognizer: { modelId: string; language: string; recognizer: SherpaRec
  * Checks platform compatibility (ARM32, musl) then loads
  * the sherpa-onnx-node module.
  *
- * Returns true if initialization succeeded.
+ * Concurrency contract: JavaScript is single-threaded with run-to-completion
+ * semantics, so there is no preemption window between the `sherpaInitialized`
+ * check, the `initPromise ??= …` claim, and the synchronous start of the
+ * async body in `doInitSherpa()`. A second caller arriving on a later
+ * microtask sees a non-null `initPromise` and awaits the same in-flight
+ * promise. After the promise settles, `sherpaInitialized` is true, so every
+ * subsequent caller takes the synchronous fast-path. There is no race window
+ * where two concurrent callers can both enter the platform-check / dynamic-
+ * import path.
  */
 export async function initSherpa(): Promise<boolean> {
 	if (sherpaInitialized) return !sherpaError;
-	if (sherpaError) return false;
+	// `??=` is a single expression: assign-if-nullish. It claims the slot
+	// before yielding, so two concurrent callers cannot both enter doInitSherpa.
+	initPromise ??= doInitSherpa();
+	return initPromise;
+}
 
+async function doInitSherpa(): Promise<boolean> {
 	try {
 		// Early platform checks — fail fast with clear messages
 		if (process.arch === "arm") {
@@ -79,6 +100,15 @@ export async function initSherpa(): Promise<boolean> {
 		sherpaError = err?.message || String(err);
 		sherpaInitialized = true;
 		return false;
+	} finally {
+		// Drop the in-flight reference once the promise settles. From here on
+		// the synchronous `sherpaInitialized` fast-path at the top of initSherpa
+		// serves every caller — keeping the resolved promise around is dead
+		// weight. Setting to null in the finally is safe because every code
+		// path through the try/catch sets `sherpaInitialized = true` before
+		// reaching here, so any later caller will fast-path and never read
+		// the now-null `initPromise`.
+		initPromise = null;
 	}
 }
 
@@ -119,8 +149,15 @@ export function getOrCreateRecognizer(model: LocalModelInfo, modelDir: string, l
 /** Destroy cached recognizer and free memory. */
 export function clearRecognizerCache(): void {
 	if (cachedRecognizer) {
-		// sherpa-onnx-node recognizers are garbage-collected via N-API Release
-		// No explicit free/delete method exists in the Node.js API
+		// sherpa-onnx-node ships no `.free()` / `.release()` / `.dispose()`
+		// method on `OfflineRecognizer` (verified in
+		// node_modules/sherpa-onnx-node/non-streaming-asr.js). Native ONNX
+		// resources are released via N-API finalizers when the JS object is
+		// garbage-collected. Dropping our last reference (cachedRecognizer
+		// set to null) makes the recognizer eligible for GC, which the
+		// platform-level concurrent / generational GC eventually reclaims.
+		// If sherpa-onnx-node ever exposes an explicit dispose API, this is
+		// the call site to wire it up.
 		cachedRecognizer = null;
 	}
 }

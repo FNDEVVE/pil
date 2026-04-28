@@ -129,7 +129,7 @@ export async function pickLanguage(
 	currentCode: string,
 	overrideLanguages?: LocalLangEntry[],
 ): Promise<string | undefined> {
-	const { Container, Input, Spacer, Text, fuzzyFilter, getEditorKeybindings } = await import("@mariozechner/pi-tui");
+	const { Container, Input, Spacer, Text, fuzzyFilter, getKeybindings } = await import("@mariozechner/pi-tui");
 
 	const langList: LangEntry[] = overrideLanguages
 		? overrideLanguages.map(l => ({ name: l.name, code: l.code, popular: l.popular }))
@@ -228,20 +228,20 @@ export async function pickLanguage(
 
 		updateList();
 
-		const kb = getEditorKeybindings();
+		const kb = getKeybindings();
 		(container as any).handleInput = (keyData: string) => {
-			if (kb.matches(keyData, "selectUp")) {
+			if (kb.matches(keyData, "tui.select.up")) {
 				if (filtered.length === 0) return;
 				selectedIndex = selectedIndex === 0 ? filtered.length - 1 : selectedIndex - 1;
 				updateList();
-			} else if (kb.matches(keyData, "selectDown")) {
+			} else if (kb.matches(keyData, "tui.select.down")) {
 				if (filtered.length === 0) return;
 				selectedIndex = selectedIndex === filtered.length - 1 ? 0 : selectedIndex + 1;
 				updateList();
-			} else if (kb.matches(keyData, "selectConfirm") || keyData === "\n") {
+			} else if (kb.matches(keyData, "tui.select.confirm") || keyData === "\n") {
 				const item = filtered[selectedIndex];
 				done(item ? item.code : undefined);
-			} else if (kb.matches(keyData, "selectCancel")) {
+			} else if (kb.matches(keyData, "tui.select.cancel")) {
 				done(undefined);
 			} else {
 				searchInput.handleInput(keyData);
@@ -311,7 +311,7 @@ export async function pickLocalModel(
 	currentModelId: string | undefined,
 	language: string,
 ): Promise<LocalModelInfo | undefined> {
-	const { Container, Input, Spacer, Text, fuzzyFilter, getEditorKeybindings } = await import("@mariozechner/pi-tui");
+	const { Container, Input, Spacer, Text, fuzzyFilter, getKeybindings } = await import("@mariozechner/pi-tui");
 
 	const device = detectDevice();
 	const allItems = LOCAL_MODELS.map(m => {
@@ -391,20 +391,20 @@ export async function pickLocalModel(
 
 		updateList();
 
-		const kb = getEditorKeybindings();
+		const kb = getKeybindings();
 		(container as any).handleInput = (keyData: string) => {
-			if (kb.matches(keyData, "selectUp")) {
+			if (kb.matches(keyData, "tui.select.up")) {
 				if (filtered.length === 0) return;
 				selectedIndex = selectedIndex === 0 ? filtered.length - 1 : selectedIndex - 1;
 				updateList();
-			} else if (kb.matches(keyData, "selectDown")) {
+			} else if (kb.matches(keyData, "tui.select.down")) {
 				if (filtered.length === 0) return;
 				selectedIndex = selectedIndex === filtered.length - 1 ? 0 : selectedIndex + 1;
 				updateList();
-			} else if (kb.matches(keyData, "selectConfirm") || keyData === "\n") {
+			} else if (kb.matches(keyData, "tui.select.confirm") || keyData === "\n") {
 				const item = filtered[selectedIndex];
 				done(item ? LOCAL_MODELS.find(m => m.id === item.id) : undefined);
-			} else if (kb.matches(keyData, "selectCancel")) {
+			} else if (kb.matches(keyData, "tui.select.cancel")) {
 				done(undefined);
 			} else {
 				searchInput.handleInput(keyData);

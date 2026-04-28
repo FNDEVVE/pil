@@ -63,7 +63,7 @@ import type {
 	ExtensionContext,
 	ExtensionCommandContext,
 } from "@mariozechner/pi-coding-agent";
-import { isKeyRelease, isKeyRepeat, matchesKey } from "@mariozechner/pi-tui";
+import { isKeyRelease, isKeyRepeat, matchesKey, type KeyId } from "@mariozechner/pi-tui";
 
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
@@ -596,6 +596,14 @@ function failStreamingSession(session: StreamingSession, err: string): void {
 
 function abortSession(session: VoiceSession | null): void {
 	if (!session || session.closed) return;
+	// Replace callbacks with no-ops BEFORE the backend-specific abort path so any
+	// in-flight async work (sherpa transcription, late ws messages, recProcess close)
+	// that resolves after abort cannot reach the recording state machine — including
+	// across session replacement, where the surviving callbacks would otherwise
+	// write into the new session's editor / fire notifications on the new ctx.
+	session.onTranscript = () => {};
+	session.onDone = () => {};
+	session.onError = () => {};
 	if (session.backend === "local") {
 		abortLocalSession(session);
 		return;
@@ -1763,7 +1771,14 @@ export default function (pi: ExtensionAPI) {
 
 	// ─── Shortcuts ───────────────────────────────────────────────────────────
 
-	pi.registerShortcut(resolvedToggleShortcut as any, {
+	// resolvedToggleShortcut is a runtime config string, but pi.registerShortcut
+	// wants the literal-union KeyId type. The string was validated by
+	// isValidShortcut() in loadGlobalToggleShortcut() (modifier+key shape with
+	// a known modifier set), so asserting `as KeyId` is honest — `as any` was
+	// strictly worse because it hid the intent and would have masked a real
+	// signature change. If pi-tui later promotes KeyId to `string`, this
+	// assertion just becomes a no-op.
+	pi.registerShortcut(resolvedToggleShortcut as KeyId, {
 		description: "Toggle voice recording (start/stop)",
 		handler: async (handlerCtx) => {
 			ctx = handlerCtx;
@@ -1803,94 +1818,141 @@ export default function (pi: ExtensionAPI) {
 
 	// ─── Lifecycle ───────────────────────────────────────────────────────────
 
-	pi.on("session_start", async (_event, startCtx) => {
+	pi.on("session_start", async (event, startCtx) => {
+		// `event.reason` was added in pi-mono 0.65.0 ("startup" | "reload" | "new" |
+		// "resume" | "fork"). Older Pi versions don't include it. Narrow defensively
+		// so the same code typechecks against both 0.57-era and 0.65+ types.
+		const reason = (event as { reason?: string } | undefined)?.reason ?? "startup";
+		const isStartup = reason === "startup";
+
+		// Non-startup transitions: pi-mono >= 0.68.0 fires session_shutdown first
+		// (and awaits it), so voiceCleanup() has already run. This is just belt-
+		// and-suspenders for older Pi versions that may skip session_shutdown on
+		// session replacement. The try/catch matches session_shutdown — a throw
+		// inside voiceCleanup (e.g. a child process kill EPERM under load) must
+		// not abort handler execution and leave ctx unassigned.
+		if (!isStartup) {
+			try { voiceCleanup(); } catch (err) {
+				voiceDebug("voiceCleanup threw during session_start", { error: String(err) });
+			}
+		}
+
 		ctx = startCtx;
 		currentCwd = startCtx.cwd;
 		const loaded = loadConfigWithSource(startCtx.cwd);
 		config = loaded.config;
 		configSource = loaded.source;
 
-		if (config.enabled && config.onboarding.completed) {
+		// Migration / setup runs on EVERY session_start, regardless of reason.
+		// Only the first-run notification is gated on isStartup.
+		if (config.onboarding.completed) {
+			// Always refresh the status bar — when voice is disabled,
+			// updateVoiceStatus() clears the entry so users don't see stale
+			// "MIC STREAM" text from a prior session. Hold-to-talk wiring
+			// only runs when enabled.
+			updateVoiceStatus();
+			if (config.enabled) {
+				setupHoldToTalk();
+			}
+			return;
+		}
+
+		// Onboarding not complete. Bail before the migration / hint UI work if the
+		// session has no UI surface — non-interactive sessions can't display
+		// notifications anyway, and migration wiring (setupHoldToTalk) requires UI.
+		if (!startCtx.hasUI) return;
+
+		// Try migration if a backend is already configured.
+		const hasKey = !!resolveDeepgramApiKey(config);
+		const hasLocalModel = config.backend === "local" && !!config.localModel;
+		const audioTool = detectAudioCaptureTool();
+		if (hasKey || hasLocalModel) {
+			// Backend configured (Deepgram key or local model) — auto-activate.
+			// Migration runs every transition; the welcome notification is gated
+			// on isStartup so /new and /resume don't re-spam the hint.
+			config.onboarding.completed = true;
+			config.onboarding.completedAt = new Date().toISOString();
+			config.onboarding.source = "migration";
+			const configToSave = getSessionStartPersistedConfig({
+				config,
+				envDeepgramApiKey: process.env.DEEPGRAM_API_KEY,
+			});
+			saveConfig(configToSave, config.scope === "project" ? "project" : "global", currentCwd);
 			updateVoiceStatus();
 			setupHoldToTalk();
-		} else if (!config.onboarding.completed) {
-			// First-time hint — show once, non-intrusive
-			const hasKey = !!resolveDeepgramApiKey(config);
-			const hasLocalModel = config.backend === "local" && !!config.localModel;
-			if (startCtx.hasUI) {
-				const audioTool = detectAudioCaptureTool();
-				if (hasKey || hasLocalModel) {
-					// Backend configured (Deepgram key or local model) — auto-activate
-					config.onboarding.completed = true;
-					config.onboarding.completedAt = new Date().toISOString();
-					config.onboarding.source = "migration";
-					const configToSave = getSessionStartPersistedConfig({
-						config,
-						envDeepgramApiKey: process.env.DEEPGRAM_API_KEY,
-					});
-					saveConfig(configToSave, config.scope === "project" ? "project" : "global", currentCwd);
-					updateVoiceStatus();
-					setupHoldToTalk();
-					const backendLabel = hasLocalModel
-						? `Local model: ${LOCAL_MODELS.find(m => m.id === config.localModel)?.name || config.localModel} (offline, batch mode)`
-						: "Deepgram Nova-3 (cloud, live streaming)";
-					const lines = [
-						"pi-listen ready!",
-						"",
-						"  Hold SPACE to record → release to transcribe",
-						`  ${toggleShortcutLabel} to toggle recording`,
-						`  Backend: ${backendLabel}`,
-						`  Audio: ${audioTool ? `${audioTool.name}` : "NONE — install sox or ffmpeg"}`,
-						"",
-						"  /voice-settings to change backend, model, or language",
-					];
-					startCtx.ui.notify(lines.join("\n"), audioTool ? "info" : "warning");
-				} else {
-					const lines = [
-						"pi-listen installed — voice input for Pi",
-						"",
-						"  Two backends available:",
-						"  • Deepgram — cloud, live streaming, $200 free credit (6–12 months of use)",
-						"  • Local models — fully offline, no API key, auto-downloads on first use",
-						"",
-						`  Audio capture: ${audioTool ? `${audioTool.name} ✓` : "not found — install sox or ffmpeg"}`,
-						"",
-						"  Run /voice-settings to choose your backend and get started.",
-					];
-					startCtx.ui.notify(lines.join("\n"), "info");
-				}
-			}
+			if (!isStartup) return;
+			const backendLabel = hasLocalModel
+				? `Local model: ${LOCAL_MODELS.find(m => m.id === config.localModel)?.name || config.localModel} (offline, batch mode)`
+				: "Deepgram Nova-3 (cloud, live streaming)";
+			const lines = [
+				"pi-listen ready!",
+				"",
+				"  Hold SPACE to record → release to transcribe",
+				`  ${toggleShortcutLabel} to toggle recording`,
+				`  Backend: ${backendLabel}`,
+				`  Audio: ${audioTool ? `${audioTool.name}` : "NONE — install sox or ffmpeg"}`,
+				"",
+				"  /voice-settings to change backend, model, or language",
+			];
+			startCtx.ui.notify(lines.join("\n"), audioTool ? "info" : "warning");
+			return;
 		}
+
+		// No backend configured — show install hint only on actual startup.
+		if (!isStartup) return;
+		const lines = [
+			"pi-listen installed — voice input for Pi",
+			"",
+			"  Two backends available:",
+			"  • Deepgram — cloud, live streaming, $200 free credit (6–12 months of use)",
+			"  • Local models — fully offline, no API key, auto-downloads on first use",
+			"",
+			`  Audio capture: ${audioTool ? `${audioTool.name} ✓` : "not found — install sox or ffmpeg"}`,
+			"",
+			"  Run /voice-settings to choose your backend and get started.",
+		];
+		startCtx.ui.notify(lines.join("\n"), "info");
 	});
 
-	pi.on("session_shutdown", async () => {
-		voiceCleanup();
-		// Clean up sherpa recognizer cache
-		try {
-			const { clearRecognizerCache } = await import("./voice/sherpa-engine");
-			clearRecognizerCache();
-		} catch {}
+	pi.on("session_shutdown", async (event) => {
+		// Synchronous teardown FIRST. Pi-mono >= 0.65.0 awaits the handler promise
+		// before firing the replacement session_start, so the late-ctx-null race
+		// the audit flagged is not present on current Pi. Keeping the order
+		// (cleanup → null → await import) is still cheap insurance for older Pi
+		// versions whose replacement path may not await. The try/catch is so a
+		// throw inside voiceCleanup (e.g. a child process kill EPERM under load)
+		// can't leak ctx or skip the recognizer cache clear.
+		try { voiceCleanup(); } catch (err) {
+			voiceDebug("voiceCleanup threw during shutdown", { error: String(err) });
+		}
 		ctx = null;
+
+		// Clear the sherpa recognizer cache ONLY on terminal quit. On older Pi
+		// versions (< 0.65.0) shutdown handlers are not awaited before the
+		// replacement session_start, so an `await import()` here can race with
+		// the new session re-initializing the recognizer — and our late
+		// clearRecognizerCache() would wipe the recognizer the new session just
+		// created. Keeping the cache across non-quit transitions is also faster:
+		// /reload, /new, /fork, /resume typically reuse the same model+language,
+		// so the recognizer is still hot. Per-session language/model changes are
+		// already invalidated in voice/settings-panel.ts when the user picks a
+		// different model. Reason is undefined on pre-0.65 Pi (where shutdown
+		// only ever fired on quit), so we treat undefined the same as "quit".
+		const reason = (event as { reason?: string } | undefined)?.reason;
+		if (reason === "quit" || reason === undefined) {
+			try {
+				const { clearRecognizerCache } = await import("./voice/sherpa-engine");
+				clearRecognizerCache();
+			} catch {}
+		}
 	});
 
-	pi.on("session_switch", async (_event, switchCtx) => {
-		// Clean up any active recording before switching
-		voiceCleanup();
-		// Clear cached recognizer — new project may use different model/language
-		try {
-			const { clearRecognizerCache } = await import("./voice/sherpa-engine");
-			clearRecognizerCache();
-		} catch {}
-		ctx = switchCtx;
-		currentCwd = switchCtx.cwd;
-		const loaded = loadConfigWithSource(switchCtx.cwd);
-		config = loaded.config;
-		configSource = loaded.source;
-		if (config.enabled && config.onboarding.completed) {
-			setupHoldToTalk();
-		}
-		updateVoiceStatus();
-	});
+	// Note: pi-mono < 0.65.0 fired a discrete "session_switch" event for
+	// /new, /resume, /fork. That event was removed in 0.65.0 in favor of the
+	// session_shutdown → session_start (with reason) flow handled above.
+	// We don't register a shim here because package.json:peerDependencies
+	// requires "@mariozechner/pi-coding-agent": ">=0.65.0", so a host without
+	// the new flow can't install this extension in the first place.
 
 	// ─── /voice command ──────────────────────────────────────────────────────
 
