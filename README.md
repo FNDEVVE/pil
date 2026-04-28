@@ -12,13 +12,14 @@
 [![license](https://img.shields.io/npm/l/@codexstar/pi-listen.svg)](https://github.com/codexstar69/pi-listen/blob/main/LICENSE)
 [![author](https://img.shields.io/badge/author-@baanditeagle-1DA1F2?logo=x&logoColor=white)](https://x.com/baanditeagle)
 
-> **v5.0.9 — Parakeet TDT v3 transcription 30-50% faster on Apple Silicon**
-> — the per-model thread cap was 4 across the board, leaving 6 of your 10
-> P-cores idle on M-series Pro/Max during local transcription. Transducer
-> models (Parakeet, Zipformer) now run with up to 6 threads while Whisper /
-> SenseVoice keep their existing 4-thread budget. CoreML provider was
-> evaluated and rejected — currently regresses transducer graphs by ~10%
-> per sherpa-onnx [#2910](https://github.com/k2-fsa/sherpa-onnx/issues/2910).
+> **v5.1.0 — Cleaner settings panel, model selection grouped by family** —
+> the Models tab now organizes 19 models into Top picks / Parakeet / Whisper
+> / Moonshine / Specialist sections with short subtitles, single-cell status,
+> right-aligned sizes, and inline language coverage hints. Two-step delete
+> confirmation on the Downloaded tab so a stray keypress can't nuke a 2 GB
+> Whisper Large download. The panel now uses your Pi theme's accent /
+> success / warning colors instead of raw ANSI. Plus performance: Parakeet
+> TDT transcription 30-50% faster on Apple Silicon Pro/Max from v5.0.9.
 > [Full changelog →](CHANGELOG.md)
 
 ---

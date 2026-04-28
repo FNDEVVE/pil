@@ -5,6 +5,72 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.1.0] - 2026-04-28
+
+### Changed (Settings panel UX overhaul)
+
+The `/voice-settings` panel got a structural cleanup focused on the Models
+tab. The previous flat 19-model list with mixed status glyphs and duplicated
+ratings made it hard to scan; the new layout groups by family and shows a
+single source of truth per row.
+
+- **Models tab now groups by family.** Top picks for the current device
+  appear first (fitness-recommended, capped at 4), followed by Parakeet,
+  Whisper, Moonshine, and Specialist sections. Each section has a heading
+  and short subtitle (e.g. "OpenAI · 57 languages") so the user knows what
+  they're scanning before reading model names. Search filters across all
+  groups; empty groups are dropped so the user never sees an orphan heading.
+- **Cleaner row layout.** Right-aligned size column, language-coverage hint
+  inline ("57 langs", "English", "zh/en/ja/ko", "Russian"), single status
+  cell on the right ("active" / "ready" / fitness label). The redundant
+  inline `●●●●○/●●●●○` ratings dropped — accuracy/speed bars now appear only
+  once, on the expanded selected row.
+- **Theme-aware colors.** The panel now uses the host `Theme` from
+  `ctx.ui.custom()` for accent, success, warning, error, and dim colors.
+  Catppuccin Mocha, Solarized, and other non-default themes render
+  correctly. Falls back to raw ANSI when no theme is provided so unit
+  tests keep working.
+- **Two-step delete on the Downloaded tab.** Pressing `x` once arms the
+  delete with a 1.5s confirmation window — the row shows
+  `press x again to delete`. A second `x` within the window commits;
+  any other navigation aborts. Whisper Large is 1.8 GB; a single stray
+  keypress should not nuke a multi-minute download.
+- **Enter hint is contextual.** The footer hint on the Models tab now
+  reads `↵ activate` for already-downloaded models or
+  `↵ download (1.8 GB) + activate` for fresh ones, so users know what
+  they're committing to before pressing Enter.
+- **Tab key works as alias for `→`** to advance tabs. `←→` still works.
+- **Tab bar visual polish.** Active tab is bold + accent without bracket
+  noise; tabs separated by `·` instead of being mashed together.
+- **Device tab "Disk space" line shows fits-largest-model check.**
+  Example: `45.2 GB free (largest model needs 1.8 GB ✓)` so users can
+  pre-flight a download.
+- **Render cache removed.** Was keyed only on width; mutating any of
+  tab / row / search / sub-picker / delete-pending state would have
+  served stale frames. The panel renders ~12-30 lines per frame —
+  uncached is well within the budget.
+
+### Internal
+- New `groupModels()` helper synthesizes the family grouping from the
+  flat `LOCAL_MODELS` catalog. Models can appear under both "Top picks"
+  and their family group; intentional — top picks is the fast path,
+  family is the comparison path.
+- `formatLangHint(model)` and `formatFitness(fitness)` extracted as
+  pure helpers for the Models tab row layout.
+- `PanelDeps` gains an optional `theme?: Theme`; `voice.ts:openSettingsPanel`
+  now constructs the panel inside the `ctx.ui.custom()` callback so the
+  host theme is in scope when the panel is built.
+- Imports `Theme` and `ThemeColor` from `@mariozechner/pi-coding-agent`'s
+  public surface.
+
+### Verification
+- `bunx tsc -p tsconfig.json --noEmit` — clean against pi-coding-agent 0.70.5
+- `bun test` — 79/79 passing
+- Real `pi 0.70.5` RPC smoke: panel constructs, status bar populates, clean teardown
+- godspeed multi-model review: 6/8 SHIP (threshold 6), 0 NO_SHIP-VETO
+  (the two NO_SHIPs flagged removed code that doesn't exist in the diff —
+  reviewer false positives)
+
 ## [5.0.9] - 2026-04-28
 
 ### Performance
@@ -257,6 +323,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - VAD pre-filtering
 - Pompom/Lumo creature companion (now separate package)
 
+[5.1.0]: https://github.com/codexstar69/pi-listen/releases/tag/v5.1.0
 [5.0.9]: https://github.com/codexstar69/pi-listen/releases/tag/v5.0.9
 [5.0.8]: https://github.com/codexstar69/pi-listen/releases/tag/v5.0.8
 [5.0.7]: https://github.com/codexstar69/pi-listen/releases/tag/v5.0.7

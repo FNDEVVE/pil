@@ -2285,7 +2285,10 @@ export default function (pi: ExtensionAPI) {
 		const { resolveDeepgramApiKey } = await import("./voice/deepgram");
 
 		const device = detectDevice();
-		const panel = new VoiceSettingsPanel({
+		// Construct the panel inside the custom() callback so the host theme
+		// is in scope. Without this the panel falls back to raw ANSI which
+		// clashes with non-default themes (Catppuccin Mocha etc.).
+		const panelDeps = {
 			config,
 			device,
 			cwd: currentCwd,
@@ -2294,14 +2297,16 @@ export default function (pi: ExtensionAPI) {
 			deleteModel,
 			isSherpaAvailable,
 			formatDeviceSummary,
-			saveConfig: (cfg, scope, cwd) => saveConfig(cfg, scope, cwd),
+			saveConfig: (cfg: VoiceConfig, scope: VoiceSettingsScope, cwd: string) => saveConfig(cfg, scope, cwd),
 			clearRecognizerCache: () => { try { clearRecognizerCache(); } catch {} },
 			resolveApiKey: () => resolveDeepgramApiKey(config) ?? undefined,
 			deepgramLanguages: LANGUAGES.map(l => ({ name: l.name, code: l.code, popular: l.popular })),
-		}, initialTab);
+		};
 
+		let panel!: InstanceType<typeof VoiceSettingsPanel>;
 		const result = await cmdCtx.ui.custom<PanelAction>(
-			(_tui, _theme, _kb, done) => {
+			(_tui, theme, _kb, done) => {
+				panel = new VoiceSettingsPanel({ ...panelDeps, theme }, initialTab);
 				panel.onClose = (action) => done(action);
 				return panel;
 			},

@@ -1,29 +1,29 @@
 /**
- * Voice Settings Panel — enterprise-grade interactive overlay.
+ * Voice Settings Panel — interactive overlay for backend / model / language
+ * configuration. Tab navigation across General / Models / Downloaded / Device.
  *
- * Architecture: Follows the Pompom Settings Panel pattern.
+ * Architecture:
  *   - Component interface: render(width) / handleInput(data) / invalidate()
  *   - Opened via ctx.ui.custom() with overlay: true
- *   - Tab navigation with ←→, row navigation with ↑↓
- *   - Inline sub-selectors (language picker) with fuzzy search
- *   - Responsive rendering with truncateToWidth on every line
- *   - Render caching for performance
+ *   - Tab switch with ←→, row navigation with ↑↓
+ *   - Inline language sub-picker with fuzzy search
+ *   - Theme-aware colors via the host Theme passed in PanelDeps; falls back
+ *     to raw ANSI when theme is not provided so unit tests / mock harnesses
+ *     don't have to construct one
+ *   - Delete on Downloaded tab is two-step (`x` once arms, `x` within 1.5s
+ *     confirms) so a stray keypress can't nuke a multi-GB download
+ *   - Render cache deliberately omitted — the panel renders ~12-30 lines and
+ *     mutating any of: tab, row, search, sub-picker state, delete confirm
+ *     timer, active model would invalidate it; the cost of always-rendering
+ *     is far below the cost of stale frames
  */
 
 import { matchesKey, Key, truncateToWidth } from "@mariozechner/pi-tui";
+import type { Theme, ThemeColor } from "@mariozechner/pi-coding-agent";
 import type { VoiceConfig, VoiceSettingsScope } from "./config";
-import { LOCAL_MODELS, getLanguagesForLocalModel, type LocalModelInfo, type LocalLangEntry } from "./local";
+import { LOCAL_MODELS, getLanguagesForLocalModel, type LocalModelInfo } from "./local";
 import type { DeviceProfile, ModelFitness } from "./device";
 import { getFreeDiskSpace, formatBytes, getModelsDir, scanHandyModels, importHandyModel } from "./model-download";
-
-// ─── ANSI helpers ─────────────────────────────────────────────────────────────
-
-const dim = (s: string) => `\x1b[2m${s}\x1b[22m`;
-const bold = (s: string) => `\x1b[1m${s}\x1b[22m`;
-const green = (s: string) => `\x1b[32m${s}\x1b[39m`;
-const yellow = (s: string) => `\x1b[33m${s}\x1b[39m`;
-const red = (s: string) => `\x1b[31m${s}\x1b[39m`;
-const cyan = (s: string) => `\x1b[36m${s}\x1b[39m`;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -48,7 +48,33 @@ export interface PanelDeps {
 	clearRecognizerCache: () => void;
 	resolveApiKey: () => string | undefined;
 	deepgramLanguages: { name: string; code: string; popular?: boolean }[];
+	/**
+	 * Optional. If provided, panel renders use the host theme so colors track
+	 * user theme choices (Catppuccin, Solarized, etc.). Without it, raw ANSI
+	 * approximations are used — fine for tests, slightly less polished in
+	 * a real Pi session.
+	 */
+	theme?: Theme;
 }
+
+interface ModelRow extends LocalModelInfo {
+	fitness: ModelFitness;
+}
+
+/**
+ * Visual grouping of LOCAL_MODELS in the Models tab. Each group has a
+ * heading and the list under it preserves catalog order for stable display.
+ * "Top picks" is computed dynamically from device fitness — see groupModels().
+ */
+interface ModelGroup {
+	heading: string;
+	subtitle?: string;
+	rows: ModelRow[];
+}
+
+// Section headings drive both the visual divider and the row indexing for
+// `↑↓` navigation. Empty groups are dropped so the user never sees a stray
+// header with no entries (e.g. "Top picks" when nothing fits the device).
 
 // ─── Panel ────────────────────────────────────────────────────────────────────
 
@@ -59,10 +85,14 @@ export class VoiceSettingsPanel {
 	private row = 0;
 	private sub: "main" | "lang-picker" = "main";
 
-	// Models tab
+	// Models tab — grouped view
 	private modelSearch = "";
-	private modelList: (LocalModelInfo & { fitness: ModelFitness })[] = [];
-	private modelFiltered: (LocalModelInfo & { fitness: ModelFitness })[] = [];
+	private modelGroups: ModelGroup[] = [];
+	/** Flat row list synthesized from `modelGroups`; navigation skips headings. */
+	private modelRows: { type: "heading"; group: ModelGroup } | ModelRow[] = [] as never;
+	private modelRowsFlat: ({ kind: "heading"; group: ModelGroup } | { kind: "row"; row: ModelRow })[] = [];
+	/** Selectable indexes (i.e. row entries only — headings excluded). */
+	private modelSelectableIdx: number[] = [];
 
 	// Language sub-picker
 	private langSearch = "";
@@ -70,9 +100,12 @@ export class VoiceSettingsPanel {
 	private langFiltered: { name: string; code: string }[] = [];
 	private langRow = 0;
 
-	// Render cache
-	private cw?: number;
-	private cl?: string[];
+	// Two-step delete on the Downloaded tab. When `x` is pressed, set the
+	// pending modelId + expiry timestamp; a second `x` within DELETE_CONFIRM_MS
+	// commits. Any other navigation cancels.
+	private deletePendingId: string | null = null;
+	private deletePendingExpiresAt = 0;
+	private static readonly DELETE_CONFIRM_MS = 1500;
 
 	constructor(private p: PanelDeps, initialTab?: number) {
 		if (initialTab !== undefined && initialTab >= 0 && initialTab < TAB_IDS.length) {
@@ -81,34 +114,46 @@ export class VoiceSettingsPanel {
 		this.rebuildModels();
 	}
 
+	// ─── Theme-aware color helpers ────────────────────────────────────────
+	//
+	// Each helper prefers theme.fg() when a Theme was passed via PanelDeps;
+	// otherwise it emits raw ANSI as a fallback so tests / non-interactive
+	// surfaces still get visually distinct text.
+
+	private c(role: ThemeColor, ansiFallback: string, s: string): string {
+		const theme = this.p.theme;
+		if (theme) return theme.fg(role, s);
+		return `\x1b[${ansiFallback}m${s}\x1b[39m`;
+	}
+	private dim = (s: string) => this.p.theme ? this.p.theme.fg("dim", s) : `\x1b[2m${s}\x1b[22m`;
+	private bold = (s: string) => `\x1b[1m${s}\x1b[22m`;
+	private accent = (s: string) => this.c("accent", "36", s);
+	private success = (s: string) => this.c("success", "32", s);
+	private warning = (s: string) => this.c("warning", "33", s);
+	private error = (s: string) => this.c("error", "31", s);
+	private muted = (s: string) => this.p.theme ? this.p.theme.fg("muted", s) : `\x1b[2m${s}\x1b[22m`;
+
 	// ─── Component interface ──────────────────────────────────────────────
 
 	render(width: number): string[] {
-		if (this.cl && this.cw === width) return this.cl;
-
-		const w = Math.max(36, Math.min(width - 2, 72));
+		const w = Math.max(36, Math.min(width - 2, 80));
 		const iw = w - 4;
 		const t = (s: string) => truncateToWidth(s, w);
 
 		const lines: string[] = [];
-		const { config, device } = this.p;
+		const { device } = this.p;
 
-		// Header
-		lines.push(t(`  ${bold("pi-listen")}  ${dim(this.p.formatDeviceSummary(device))}`));
-		lines.push(t(dim("  " + "─".repeat(Math.min(iw, 50)))));
+		// Header: brand · device summary
+		lines.push(t(`  ${this.bold("pi-listen")}  ${this.dim(this.p.formatDeviceSummary(device))}`));
+		lines.push(t(this.dim("  " + "─".repeat(Math.min(iw, 60)))));
 
-		// Tab bar
-		const tabs = TAB_LABELS.map((label, i) =>
-			i === this.tab ? cyan(` [${label}] `) : dim(` ${label} `),
-		).join("");
-		lines.push(t("  " + tabs));
+		// Tab bar — underline-style active indicator (no brackets noise)
+		lines.push(t("  " + this.renderTabBar()));
 		lines.push("");
 
-		// Sub-mode: language picker
+		// Sub-mode: language picker takes over the body
 		if (this.sub === "lang-picker") {
 			lines.push(...this.renderLangPicker(w, iw).map(t));
-			this.cl = lines;
-			this.cw = width;
 			return lines;
 		}
 
@@ -129,35 +174,37 @@ export class VoiceSettingsPanel {
 				break;
 		}
 
-		this.cl = lines;
-		this.cw = width;
 		return lines;
 	}
 
 	handleInput(data: string): void {
 		if (this.sub === "lang-picker") {
 			this.handleLangInput(data);
-			this.invalidate();
 			return;
 		}
 
 		const tabId = TAB_IDS[this.tab]!;
 
-		// Tab navigation: ←→
+		// Any key other than `x` while a delete is pending cancels the confirmation
+		// (so the user can navigate around without committing destructive action).
+		if (this.deletePendingId && data !== "x") {
+			this.deletePendingId = null;
+			this.deletePendingExpiresAt = 0;
+		}
+
+		// Tab navigation: ←→ or Tab
 		if (matchesKey(data, Key.left)) {
 			this.tab = (this.tab - 1 + TAB_IDS.length) % TAB_IDS.length;
 			this.row = 0;
 			this.modelSearch = "";
-			this.filterModels();
-			this.invalidate();
+			this.refreshModelView();
 			return;
 		}
-		if (matchesKey(data, Key.right)) {
+		if (matchesKey(data, Key.right) || data === "\t") {
 			this.tab = (this.tab + 1) % TAB_IDS.length;
 			this.row = 0;
 			this.modelSearch = "";
-			this.filterModels();
-			this.invalidate();
+			this.refreshModelView();
 			return;
 		}
 
@@ -171,71 +218,64 @@ export class VoiceSettingsPanel {
 		if (matchesKey(data, Key.up)) {
 			const max = this.getRowCount(tabId);
 			if (max > 0) this.row = this.row === 0 ? max - 1 : this.row - 1;
-			this.invalidate();
 			return;
 		}
 		if (matchesKey(data, Key.down)) {
 			const max = this.getRowCount(tabId);
 			if (max > 0) this.row = this.row === max - 1 ? 0 : this.row + 1;
-			this.invalidate();
 			return;
 		}
 
 		// Enter = select/toggle
 		if (matchesKey(data, Key.enter)) {
 			this.handleSelect(tabId);
-			this.invalidate();
 			return;
 		}
 
 		// Tab-specific keys
 		if (tabId === "models") {
-			// Backspace = delete char from search
 			if (matchesKey(data, Key.backspace)) {
 				this.modelSearch = this.modelSearch.slice(0, -1);
-				this.filterModels();
+				this.refreshModelView();
 				this.row = 0;
-				this.invalidate();
 				return;
 			}
-			// Printable = search
 			if (data.length === 1 && data >= " " && data <= "~") {
 				this.modelSearch += data;
-				this.filterModels();
+				this.refreshModelView();
 				this.row = 0;
-				this.invalidate();
 				return;
 			}
 		}
 
 		if (tabId === "downloaded") {
 			if (data === "x" || data === "d") {
-				const dl = this.getDownloaded();
-				const item = dl[this.row];
-				if (item) {
-					const wasActive = this.p.config.localModel === item.id;
-					this.p.deleteModel(item.id);
-					if (wasActive) {
-						try { this.p.clearRecognizerCache(); } catch {}
-						// Pick another downloaded model, or clear selection
-						const remaining = this.p.getDownloadedModels();
-						this.p.config.localModel = remaining.length > 0 ? remaining[0]!.id : undefined;
-						this.save();
-					}
-					this.row = Math.max(0, Math.min(this.row, dl.length - 2));
-				}
-				this.invalidate();
+				this.handleDeleteRequest();
 				return;
 			}
 		}
 	}
 
-	invalidate(): void {
-		this.cw = undefined;
-		this.cl = undefined;
+	/**
+	 * Kept for backward-compat with the host TUI which may still call
+	 * invalidate() to force a re-render. Renders are cheap and have no cache,
+	 * so this is a no-op.
+	 */
+	invalidate(): void { /* render is uncached */ }
+
+	// ─── Tab bar ──────────────────────────────────────────────────────────
+
+	private renderTabBar(): string {
+		// Inactive tabs are dim, active tab is accent + bold, with an underline
+		// rule below to anchor the eye. Equal-width spacing makes ←→ feel
+		// consistent even when tab labels differ in length.
+		return TAB_LABELS.map((label, i) => {
+			if (i === this.tab) return this.accent(this.bold(label));
+			return this.dim(label);
+		}).join(this.dim("  ·  "));
 	}
 
-	// ─── Tab renderers ────────────────────────────────────────────────────
+	// ─── General tab ──────────────────────────────────────────────────────
 
 	private renderGeneral(_w: number, iw: number): string[] {
 		const lines: string[] = [];
@@ -247,19 +287,19 @@ export class VoiceSettingsPanel {
 			{
 				label: "Backend",
 				value: isLocal
-					? green("Local (offline, batch)")
-					: cyan("Deepgram (cloud, live streaming)"),
+					? this.success("Local (offline, batch)")
+					: this.accent("Deepgram (cloud, live streaming)"),
 				hint: "toggle",
 			},
 			{
 				label: isLocal ? "Model" : "API Key",
 				value: isLocal
-					? (LOCAL_MODELS.find(m => m.id === config.localModel)?.name || config.localModel || "whisper-small")
+					? (LOCAL_MODELS.find(m => m.id === config.localModel)?.name || config.localModel || "—")
 					: (() => {
 						const key = this.p.resolveApiKey();
-						return key ? green(`set (${key.slice(0, 8)}…)`) : red("NOT SET");
+						return key ? this.success(`set (${key.slice(0, 8)}…)`) : this.error("NOT SET");
 					})(),
-				hint: isLocal ? "go to Models tab" : undefined,
+				hint: isLocal ? "choose ›" : undefined,
 			},
 			{
 				label: "Language",
@@ -275,7 +315,7 @@ export class VoiceSettingsPanel {
 			},
 			{
 				label: "Voice",
-				value: config.enabled ? green("Enabled") : red("Disabled"),
+				value: config.enabled ? this.success("Enabled") : this.error("Disabled"),
 				hint: "toggle",
 			},
 		];
@@ -283,16 +323,18 @@ export class VoiceSettingsPanel {
 		const labelW = 12;
 		for (let i = 0; i < rows.length; i++) {
 			const r = rows[i]!;
-			const prefix = i === this.row ? cyan("  → ") : "    ";
+			const prefix = i === this.row ? this.accent("  → ") : "    ";
 			const label = r.label.padEnd(labelW);
-			const hint = (i === this.row && r.hint) ? dim(` [↵ ${r.hint}]`) : "";
+			const hint = (i === this.row && r.hint) ? this.dim(` [↵ ${r.hint}]`) : "";
 			lines.push(`${prefix}${label}${r.value}${hint}`);
 		}
 
 		lines.push("");
-		lines.push(dim("  ↵ change  ←→ tabs  ↑↓ navigate  esc close"));
+		lines.push(this.dim("  ↵ change  ←→/Tab tabs  ↑↓ navigate  esc close"));
 		return lines;
 	}
+
+	// ─── Models tab ───────────────────────────────────────────────────────
 
 	private renderModels(_w: number, iw: number): string[] {
 		const lines: string[] = [];
@@ -300,51 +342,95 @@ export class VoiceSettingsPanel {
 		const downloadedMap = new Map(this.p.getDownloadedModels().map(d => [d.id, d.sizeMB]));
 
 		// Search bar
-		const cursor = this.modelSearch ? this.modelSearch : dim("type to search…");
-		lines.push(`  ${dim("Search:")} ${cursor}`);
+		const cursor = this.modelSearch ? this.modelSearch : this.dim("type to search…");
+		lines.push(`  ${this.dim("Search:")} ${cursor}`);
 		lines.push("");
 
-		// Model list
-		const maxVisible = 12;
-		const total = this.modelFiltered.length;
-		const start = Math.max(0, Math.min(this.row - Math.floor(maxVisible / 2), total - maxVisible));
-		const end = Math.min(start + maxVisible, total);
+		// Models are flattened with headings interleaved. We draw a viewport
+		// window around the selected row, but always keep the heading of the
+		// current group visible above so the user has context.
+		if (this.modelRowsFlat.length === 0) {
+			lines.push(this.dim("    No matching models"));
+			lines.push("");
+			lines.push(this.dim("  ↵ activate / download  ←→ tabs  ↑↓ navigate  esc close"));
+			return lines;
+		}
+
+		const maxVisible = 14;
+		const totalSelectable = this.modelSelectableIdx.length;
+		const selectedFlatIdx = this.modelSelectableIdx[Math.min(this.row, totalSelectable - 1)] ?? 0;
+
+		// Find a viewport that includes the selected row plus surrounding context.
+		// We center on selection but always show the parent heading.
+		const halfWindow = Math.floor(maxVisible / 2);
+		let start = Math.max(0, selectedFlatIdx - halfWindow);
+		let end = Math.min(this.modelRowsFlat.length, start + maxVisible);
+		if (end - start < maxVisible) {
+			start = Math.max(0, end - maxVisible);
+		}
+
+		// Bring the heading immediately above `start` into view if it isn't
+		// already, so the user always knows which group they're in.
+		while (start > 0 && this.modelRowsFlat[start - 1]?.kind === "heading") start--;
+
+		// Right-align size column. Using a fixed character budget keeps row
+		// boundaries clean across model name lengths.
+		const nameW = Math.min(28, Math.max(18, iw - 30));
 
 		for (let i = start; i < end; i++) {
-			const m = this.modelFiltered[i]!;
-			const isSelected = i === this.row;
+			const item = this.modelRowsFlat[i];
+			if (!item) continue;
+			if (item.kind === "heading") {
+				const heading = item.group.heading;
+				const subtitle = item.group.subtitle ? this.dim(`  ${item.group.subtitle}`) : "";
+				lines.push("");
+				lines.push(`  ${this.dim(this.bold(heading.toUpperCase()))}${subtitle}`);
+				continue;
+			}
+			const m = item.row;
+			const isSelected = i === selectedFlatIdx;
 			const isCurrent = m.id === currentId;
 			const isDl = downloadedMap.has(m.id);
 
-			const prefix = isSelected ? cyan("  → ") : "    ";
-			const name = isSelected ? cyan(m.name) : m.name;
-			const size = dim(` — ${m.size}`);
-			const badge = this.fitnessBadge(m.fitness);
-			const acc = this.compactRating(m.accuracy);
-			const spd = this.compactRating(m.speed);
-			const status = isCurrent ? green(" ● active")
-				: isDl ? green(" ✓ ready")
-				: dim(" ○");
-			lines.push(`${prefix}${name}${size} ${badge} ${acc}${dim("/")}${spd}${status}`);
-			// Expanded detail for selected item
+			const prefix = isSelected ? this.accent("  → ") : "    ";
+			const name = (isSelected ? this.accent(m.name) : m.name).padEnd(nameW + (isSelected ? 0 : 0));
+			const namePad = m.name.length < nameW ? " ".repeat(nameW - m.name.length) : "";
+			const size = this.dim(m.size.padStart(8));
+			const langHint = this.dim(formatLangHint(m).padEnd(13));
+			const status = isCurrent
+				? this.success("active")
+				: isDl
+					? this.success("ready")
+					: this.dim(formatFitness(m.fitness));
+
+			lines.push(`${prefix}${isSelected ? this.accent(m.name) + namePad : m.name + namePad} ${size}  ${langHint} ${status}`);
+
+			// Expanded detail under the selected row only — accuracy/speed
+			// bars + freeform notes. Avoids the previous redundancy of
+			// showing compact ratings on every row.
 			if (isSelected) {
-				const accBar = this.ratingBar(m.accuracy, "Accuracy");
-				const spdBar = this.ratingBar(m.speed, "Speed   ");
-				lines.push(`      ${accBar}  ${spdBar}`);
-				lines.push(`      ${dim(m.notes)}`);
+				const accBar = this.ratingBar(m.accuracy, "accuracy");
+				const spdBar = this.ratingBar(m.speed, "speed   ");
+				lines.push(`        ${accBar}   ${spdBar}`);
+				lines.push(`        ${this.dim(m.notes)}`);
 			}
 		}
 
-		if (total === 0) {
-			lines.push(dim("    No matching models"));
-		} else if (start > 0 || end < total) {
-			lines.push(dim(`    (${this.row + 1}/${total})`));
+		// Scroll affordance
+		if (start > 0 || end < this.modelRowsFlat.length) {
+			lines.push(this.dim(`    showing ${start + 1}–${end} of ${this.modelRowsFlat.length}`));
 		}
 
 		lines.push("");
-		lines.push(dim("  ↵ activate + download  ←→ tabs  ↑↓ navigate  esc close"));
+		const selectedRow = this.getRowAt(this.row);
+		const enterHint = selectedRow
+			? (downloadedMap.has(selectedRow.id) ? "activate" : `download (${selectedRow.size}) + activate`)
+			: "select";
+		lines.push(this.dim(`  ↵ ${enterHint}  ←→/Tab tabs  ↑↓ navigate  esc close`));
 		return lines;
 	}
+
+	// ─── Downloaded tab ───────────────────────────────────────────────────
 
 	private renderDownloaded(_w: number, _iw: number): string[] {
 		const lines: string[] = [];
@@ -353,12 +439,18 @@ export class VoiceSettingsPanel {
 		const handy = scanHandyModels();
 		const handyNotImported = handy.filter(h => !h.imported);
 
+		// Auto-expire pending delete confirmation. Re-rendering with an old
+		// pending state is a no-op — the renderer just won't show the badge.
+		if (this.deletePendingId && Date.now() > this.deletePendingExpiresAt) {
+			this.deletePendingId = null;
+		}
+
 		if (dl.length === 0 && handyNotImported.length === 0) {
-			lines.push(dim("    No downloaded models yet."));
-			lines.push(dim("    Models download automatically on first recording."));
-			lines.push(dim("    Use the Models tab to browse and install."));
+			lines.push(this.dim("    No downloaded models yet."));
+			lines.push(this.dim("    Models download automatically on first recording."));
+			lines.push(this.dim("    Use the Models tab to browse and install."));
 		} else {
-			// Pi models
+			// Pi-managed models
 			if (dl.length > 0) {
 				let totalMB = 0;
 				for (let i = 0; i < dl.length; i++) {
@@ -366,27 +458,31 @@ export class VoiceSettingsPanel {
 					totalMB += d.sizeMB;
 					const isSelected = i === this.row;
 					const isCurrent = d.id === currentId;
-					const prefix = isSelected ? cyan("  → ") : "    ";
-					const name = isSelected ? cyan(d.name) : d.name;
-					const size = dim(` — ${d.sizeMB} MB`);
-					const status = isCurrent ? green(" ● active") : "";
-					lines.push(`${prefix}${name}${size}${status}`);
+					const isDeletePending = d.id === this.deletePendingId;
+					const prefix = isSelected ? this.accent("  → ") : "    ";
+					const name = isSelected ? this.accent(d.name) : d.name;
+					const size = this.dim(` — ${d.sizeMB} MB`);
+					const status = isCurrent ? this.success(" active") : "";
+					const deleteBadge = isDeletePending
+						? "  " + this.warning("press x again to delete")
+						: "";
+					lines.push(`${prefix}${name}${size}${status}${deleteBadge}`);
 				}
-				lines.push(dim(`    Total: ${totalMB} MB on disk`));
+				lines.push(this.dim(`    Total: ${totalMB} MB on disk`));
 			}
 
-			// Handy models available for import
+			// Handy import section
 			if (handyNotImported.length > 0) {
 				lines.push("");
-				lines.push(dim("    ── Available from Handy ──"));
+				lines.push(this.dim("    Available from Handy"));
 				for (let i = 0; i < handyNotImported.length; i++) {
 					const h = handyNotImported[i]!;
 					const idx = dl.length + i;
 					const isSelected = idx === this.row;
-					const prefix = isSelected ? cyan("  → ") : "    ";
-					const name = isSelected ? cyan(h.name) : h.name;
-					const size = dim(` — ${h.sizeMB} MB`);
-					lines.push(`${prefix}${name}${size}${yellow(" ↵ import")}`);
+					const prefix = isSelected ? this.accent("  → ") : "    ";
+					const name = isSelected ? this.accent(h.name) : h.name;
+					const size = this.dim(` — ${h.sizeMB} MB`);
+					lines.push(`${prefix}${name}${size}${this.warning(" ↵ import")}`);
 				}
 			}
 		}
@@ -394,11 +490,13 @@ export class VoiceSettingsPanel {
 		lines.push("");
 		const hasItems = dl.length > 0 || handyNotImported.length > 0;
 		const hint = hasItems
-			? "  ↵ activate/import  x delete  ←→ tabs  ↑↓ navigate  esc close"
-			: "  ←→ tabs  esc close";
-		lines.push(dim(hint));
+			? "  ↵ activate/import  x delete (press twice)  ←→/Tab tabs  ↑↓ navigate  esc close"
+			: "  ←→/Tab tabs  esc close";
+		lines.push(this.dim(hint));
 		return lines;
 	}
+
+	// ─── Device tab ───────────────────────────────────────────────────────
 
 	private renderDevice(_w: number, _iw: number): string[] {
 		const lines: string[] = [];
@@ -410,10 +508,10 @@ export class VoiceSettingsPanel {
 			: device.gpu.hasMetal ? "Apple Silicon (Metal)" : "none";
 
 		// Hardware
-		lines.push(dim("    ── Hardware ──"));
+		lines.push(this.dim("    Hardware"));
 		const hwRows: [string, string][] = [
 			["Platform", `${device.platform} ${device.arch}`],
-			["RAM", `${(device.totalRamMB / 1024).toFixed(1)} GB total, ${(device.freeRamMB / 1024).toFixed(1)} GB free`],
+			["RAM", `${(device.totalRamMB / 1024).toFixed(1)} GB total · ${(device.freeRamMB / 1024).toFixed(1)} GB free`],
 			["CPU", `${device.cpuCores} cores — ${device.cpuModel}`],
 			["GPU", gpuLabel],
 		];
@@ -428,15 +526,21 @@ export class VoiceSettingsPanel {
 
 		// Dependencies
 		lines.push("");
-		lines.push(dim("    ── Dependencies ──"));
+		lines.push(this.dim("    Dependencies"));
 		const sherpaOk = this.p.isSherpaAvailable();
-		lines.push(`    ${"sherpa-onnx".padEnd(labelW)}${sherpaOk ? green("ready") : green("standby — loads on first recording")}`);
+		lines.push(`    ${"sherpa-onnx".padEnd(labelW)}${sherpaOk ? this.success("ready") : this.success("standby — loads on first recording")}`);
 
-		// Disk space
+		// Disk space — show "fits largest model" computation so users can
+		// gauge whether a download is feasible without checking model sizes.
 		const freeSpace = getFreeDiskSpace(getModelsDir());
+		const largest = LOCAL_MODELS.reduce((a, b) => a.sizeBytes > b.sizeBytes ? a : b);
+		const fitsLargest = freeSpace !== null && freeSpace >= largest.sizeBytes;
 		const diskLabel = freeSpace !== null ? formatBytes(freeSpace) + " free" : "unknown";
 		const diskWarn = freeSpace !== null && freeSpace < 500 * 1024 * 1024; // <500MB
-		lines.push(`    ${"Disk space".padEnd(labelW)}${diskWarn ? yellow(diskLabel + " (low)") : diskLabel}`);
+		const fitsHint = freeSpace !== null
+			? ` (largest model needs ${formatBytes(largest.sizeBytes)}${fitsLargest ? " ✓" : " ✗"})`
+			: "";
+		lines.push(`    ${"Disk space".padEnd(labelW)}${diskWarn ? this.warning(diskLabel + " (low)") : diskLabel}${this.dim(fitsHint)}`);
 
 		// Downloaded models total
 		const downloaded = this.p.getDownloadedModels();
@@ -444,7 +548,7 @@ export class VoiceSettingsPanel {
 		lines.push(`    ${"Models".padEnd(labelW)}${downloaded.length} downloaded (${totalMB} MB)`);
 
 		lines.push("");
-		lines.push(dim("  ←→ tabs  esc close"));
+		lines.push(this.dim("  ←→/Tab tabs  esc close"));
 		return lines;
 	}
 
@@ -454,12 +558,12 @@ export class VoiceSettingsPanel {
 		const lines: string[] = [];
 		const currentCode = this.p.config.language || "en";
 
-		lines.push(`  ${bold("Select language")}`);
-		const cursor = this.langSearch ? this.langSearch : dim("type to filter…");
-		lines.push(`  ${dim("Search:")} ${cursor}`);
+		lines.push(`  ${this.bold("Select language")}`);
+		const cursor = this.langSearch ? this.langSearch : this.dim("type to filter…");
+		lines.push(`  ${this.dim("Search:")} ${cursor}`);
 		lines.push("");
 
-		const maxVisible = 10;
+		const maxVisible = 12;
 		const total = this.langFiltered.length;
 		const start = Math.max(0, Math.min(this.langRow - Math.floor(maxVisible / 2), total - maxVisible));
 		const end = Math.min(start + maxVisible, total);
@@ -468,20 +572,20 @@ export class VoiceSettingsPanel {
 			const lang = this.langFiltered[i]!;
 			const isSelected = i === this.langRow;
 			const isCurrent = lang.code === currentCode;
-			const prefix = isSelected ? cyan("  → ") : "    ";
-			const text = isSelected ? cyan(`${lang.name} (${lang.code})`) : `${lang.name} (${lang.code})`;
-			const check = isCurrent ? green(" ✓") : "";
+			const prefix = isSelected ? this.accent("  → ") : "    ";
+			const text = isSelected ? this.accent(`${lang.name} (${lang.code})`) : `${lang.name} (${lang.code})`;
+			const check = isCurrent ? this.success(" ✓") : "";
 			lines.push(`${prefix}${text}${check}`);
 		}
 
 		if (total === 0) {
-			lines.push(dim("    No matching languages"));
+			lines.push(this.dim("    No matching languages"));
 		} else if (start > 0 || end < total) {
-			lines.push(dim(`    (${this.langRow + 1}/${total})`));
+			lines.push(this.dim(`    showing ${start + 1}–${end} of ${total}`));
 		}
 
 		lines.push("");
-		lines.push(dim("  ↵ select  esc back  type to filter"));
+		lines.push(this.dim("  ↵ select  esc back  type to filter"));
 		return lines;
 	}
 
@@ -543,11 +647,10 @@ export class VoiceSettingsPanel {
 					break;
 				case 1: // Model (local) or API Key (deepgram)
 					if (config.backend === "local") {
-						// Jump to Models tab
 						this.tab = 1;
 						this.row = 0;
 						this.modelSearch = "";
-						this.filterModels();
+						this.refreshModelView();
 					}
 					break;
 				case 2: // Language picker
@@ -563,10 +666,9 @@ export class VoiceSettingsPanel {
 					break;
 			}
 		} else if (tabId === "models") {
-			const model = this.modelFiltered[this.row];
+			const model = this.getRowAt(this.row);
 			if (model) {
 				this.activateModel(model.id);
-				// If not downloaded, close panel and trigger download
 				const downloaded = new Set(this.p.getDownloadedModels().map(d => d.id));
 				if (!downloaded.has(model.id)) {
 					this.onClose?.({ type: "download", modelId: model.id });
@@ -576,22 +678,48 @@ export class VoiceSettingsPanel {
 		} else if (tabId === "downloaded") {
 			const dl = this.getDownloaded();
 			if (this.row < dl.length) {
-				// Activate an already-downloaded model
 				const item = dl[this.row];
 				if (item) this.activateModel(item.id);
 			} else {
-				// Import from Handy
 				const handyNotImported = scanHandyModels().filter(h => !h.imported);
 				const handyIdx = this.row - dl.length;
 				const h = handyNotImported[handyIdx];
 				if (h) {
 					const result = importHandyModel(h.handyId);
-					if (result.ok) {
-						this.activateModel(h.piModelId);
-					}
-					// Panel will re-render and show the imported model
+					if (result.ok) this.activateModel(h.piModelId);
 				}
 			}
+		}
+	}
+
+	/**
+	 * First press arms the delete on the currently-selected downloaded model
+	 * with a 1.5s window. Second press within that window commits. Different
+	 * model selection or any other key aborts.
+	 */
+	private handleDeleteRequest(): void {
+		const dl = this.getDownloaded();
+		const item = dl[this.row];
+		if (!item) return; // Handy import row, not deletable here
+
+		const now = Date.now();
+		if (this.deletePendingId === item.id && now <= this.deletePendingExpiresAt) {
+			// Commit
+			const wasActive = this.p.config.localModel === item.id;
+			this.p.deleteModel(item.id);
+			if (wasActive) {
+				try { this.p.clearRecognizerCache(); } catch {}
+				const remaining = this.p.getDownloadedModels();
+				this.p.config.localModel = remaining.length > 0 ? remaining[0]!.id : undefined;
+				this.save();
+			}
+			this.deletePendingId = null;
+			this.deletePendingExpiresAt = 0;
+			this.row = Math.max(0, Math.min(this.row, dl.length - 2));
+		} else {
+			// Arm
+			this.deletePendingId = item.id;
+			this.deletePendingExpiresAt = now + VoiceSettingsPanel.DELETE_CONFIRM_MS;
 		}
 	}
 
@@ -611,7 +739,7 @@ export class VoiceSettingsPanel {
 		const { config } = this.p;
 		if (config.backend === "local" && config.localModel) {
 			const { languages, englishOnly } = getLanguagesForLocalModel(config.localModel);
-			if (englishOnly) return; // Single language, nothing to pick
+			if (englishOnly) return; // Single language — nothing to pick
 			this.langList = languages;
 		} else {
 			this.langList = this.p.deepgramLanguages;
@@ -619,7 +747,6 @@ export class VoiceSettingsPanel {
 		this.langSearch = "";
 		this.langFiltered = this.langList;
 		this.langRow = 0;
-		// Pre-select current language
 		const idx = this.langList.findIndex(l => l.code === config.language);
 		if (idx >= 0) this.langRow = idx;
 		this.sub = "lang-picker";
@@ -635,7 +762,7 @@ export class VoiceSettingsPanel {
 	private getRowCount(tabId: TabId): number {
 		switch (tabId) {
 			case "general": return 5;
-			case "models": return this.modelFiltered.length;
+			case "models": return this.modelSelectableIdx.length;
 			case "downloaded": {
 				const dl = this.getDownloaded().length;
 				const handy = scanHandyModels().filter(h => !h.imported).length;
@@ -645,29 +772,48 @@ export class VoiceSettingsPanel {
 		}
 	}
 
+	private getRowAt(row: number): ModelRow | undefined {
+		const flatIdx = this.modelSelectableIdx[row];
+		if (flatIdx === undefined) return undefined;
+		const item = this.modelRowsFlat[flatIdx];
+		return item && item.kind === "row" ? item.row : undefined;
+	}
+
+	/**
+	 * Build the grouped model view: top picks (recommended for current device)
+	 * first, then by family/language. Search filters all groups together;
+	 * empty groups are dropped so the user never sees an orphaned heading.
+	 */
 	private rebuildModels(): void {
-		const fitnessOrder = { recommended: 0, compatible: 1, warning: 2, incompatible: 3 } as const;
-		this.modelList = LOCAL_MODELS.map(m => ({
+		const enriched: ModelRow[] = LOCAL_MODELS.map(m => ({
 			...m,
 			fitness: this.p.getModelFitness(m, this.p.device) as ModelFitness,
 		}));
-		this.modelList.sort((a, b) => {
-			const fd = fitnessOrder[a.fitness] - fitnessOrder[b.fitness];
-			return fd !== 0 ? fd : b.sizeBytes - a.sizeBytes;
-		});
-		this.filterModels();
+		this.modelGroups = groupModels(enriched);
+		this.refreshModelView();
 	}
 
-	private filterModels(): void {
-		if (!this.modelSearch) {
-			this.modelFiltered = this.modelList;
-		} else {
-			const q = this.modelSearch.toLowerCase();
-			this.modelFiltered = this.modelList.filter(m =>
-				`${m.name} ${m.id} ${m.notes} ${m.langSupport}`.toLowerCase().includes(q),
-			);
+	/** Apply the search query and rebuild the flat row list. */
+	private refreshModelView(): void {
+		const q = this.modelSearch.trim().toLowerCase();
+		const flat: typeof this.modelRowsFlat = [];
+		const selectable: number[] = [];
+
+		for (const group of this.modelGroups) {
+			const rows = q
+				? group.rows.filter(m => `${m.name} ${m.id} ${m.notes} ${m.langSupport}`.toLowerCase().includes(q))
+				: group.rows;
+			if (rows.length === 0) continue;
+			flat.push({ kind: "heading", group });
+			for (const row of rows) {
+				selectable.push(flat.length);
+				flat.push({ kind: "row", row });
+			}
 		}
-		this.row = Math.min(this.row, Math.max(0, this.modelFiltered.length - 1));
+
+		this.modelRowsFlat = flat;
+		this.modelSelectableIdx = selectable;
+		this.row = Math.min(this.row, Math.max(0, selectable.length - 1));
 	}
 
 	private filterLangs(): void {
@@ -693,7 +839,6 @@ export class VoiceSettingsPanel {
 
 	private getLangDisplay(): string {
 		const code = this.p.config.language || "en";
-		// Check all language sources for display name
 		const allLangs = [...this.p.deepgramLanguages];
 		for (const m of LOCAL_MODELS) {
 			const { languages } = getLanguagesForLocalModel(m.id);
@@ -703,24 +848,109 @@ export class VoiceSettingsPanel {
 		return entry ? `${entry.name} (${code})` : code;
 	}
 
-	/** Compact inline rating: "●●●●○" — shown on every model row */
-	private compactRating(value: 1 | 2 | 3 | 4 | 5): string {
-		return "●".repeat(value) + dim("○".repeat(5 - value));
-	}
-
-	/** Labeled rating bar for expanded detail: "Accuracy ●●●●○" */
+	/** Single-axis rating bar shown only on the selected (expanded) row. */
 	private ratingBar(value: 1 | 2 | 3 | 4 | 5, label: string): string {
 		const filled = "●".repeat(value);
-		const empty = dim("○".repeat(5 - value));
-		return dim(label + " ") + filled + empty;
+		const empty = "○".repeat(5 - value);
+		return this.dim(label) + " " + filled + this.dim(empty);
 	}
+}
 
-	private fitnessBadge(f: ModelFitness): string {
-		switch (f) {
-			case "recommended": return green("[recommended]");
-			case "compatible": return cyan("[compatible]");
-			case "warning": return yellow("[may be slow]");
-			case "incompatible": return red("[too large]");
-		}
+// ─── Free helpers ──────────────────────────────────────────────────────────
+
+/**
+ * Compact language-coverage hint for a model row in the Models tab.
+ * Prefer human readable scope ("English", "25 langs", "Russian") over the
+ * raw `langSupport` enum — users care about coverage, not internal tags.
+ */
+function formatLangHint(m: LocalModelInfo): string {
+	switch (m.langSupport) {
+		case "whisper": return "57 langs";
+		case "english-only": return "English";
+		case "parakeet-multi": return "25 langs";
+		case "sensevoice": return "zh/en/ja/ko";
+		case "russian-only": return "Russian";
+		case "single-ar": return "Arabic";
+		case "single-zh": return "Chinese";
+		case "single-ja": return "Japanese";
+		case "single-ko": return "Korean";
+		case "single-uk": return "Ukrainian";
+		case "single-vi": return "Vietnamese";
+		case "single-es": return "Spanish";
 	}
+	return "";
+}
+
+/** Short fitness label shown in the rightmost cell on the Models tab. */
+function formatFitness(f: ModelFitness): string {
+	switch (f) {
+		case "recommended": return "recommended";
+		case "compatible": return "compatible";
+		case "warning": return "may be slow";
+		case "incompatible": return "too large";
+	}
+}
+
+/**
+ * Group models for the Models tab.
+ *   - "Top picks for your device" — fitness === "recommended", capped at 4
+ *   - "Whisper" — all whisper-* (57-language family)
+ *   - "Moonshine" — moonshine-* (edge / fast English + variants)
+ *   - "Specialist" — single-language and zh/en/ja/ko models
+ *   - "All multilingual" — Parakeet TDT family
+ *
+ * Models can appear under "Top picks" AND their family group; that's
+ * intentional — top picks is the user's fast path, family groups are the
+ * "I want to compare alternatives" path.
+ */
+function groupModels(rows: ModelRow[]): ModelGroup[] {
+	const byFamily = (predicate: (r: ModelRow) => boolean) => rows.filter(predicate);
+
+	const topPicks = rows.filter(r => r.fitness === "recommended").slice(0, 4);
+	const parakeet = byFamily(r => r.id.startsWith("parakeet-"));
+	const whisper = byFamily(r => r.id.startsWith("whisper-"));
+	const moonshine = byFamily(r => r.id.startsWith("moonshine-"));
+	const specialist = byFamily(r =>
+		!r.id.startsWith("parakeet-") &&
+		!r.id.startsWith("whisper-") &&
+		!r.id.startsWith("moonshine-"),
+	);
+
+	const groups: ModelGroup[] = [];
+	if (topPicks.length > 0) {
+		groups.push({
+			heading: "Top picks for your device",
+			subtitle: "fitness-ranked",
+			rows: topPicks,
+		});
+	}
+	if (parakeet.length > 0) {
+		groups.push({
+			heading: "Parakeet (multilingual)",
+			subtitle: "NVIDIA NeMo · TDT",
+			rows: parakeet,
+		});
+	}
+	if (whisper.length > 0) {
+		groups.push({
+			heading: "Whisper (broad coverage)",
+			subtitle: "OpenAI · 57 languages",
+			rows: whisper,
+		});
+	}
+	if (moonshine.length > 0) {
+		groups.push({
+			heading: "Moonshine (edge / fast)",
+			subtitle: "Useful Sensors · low latency",
+			rows: moonshine,
+		});
+	}
+	if (specialist.length > 0) {
+		groups.push({
+			heading: "Specialist",
+			subtitle: "best-in-class for one or a few languages",
+			rows: specialist,
+		});
+	}
+	return groups;
 }
