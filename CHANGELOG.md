@@ -5,6 +5,119 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.0.0] - 2026-04-28
+
+**Major release — pi-listen is now bidirectional voice for Pi.** Voice in
+(hold-to-talk STT, unchanged from v5.x) plus voice out (manual `/voice-speak`
+TTS, opt-in). The package's `description` and tagline expand to reflect
+that — major bump signals the new capability.
+
+### New — Local TTS engine (offline, sherpa-onnx)
+
+- **12 local TTS models in the catalog**, downloaded on demand:
+  - **Kitten Nano v0.2 fp16** (default, 25.4 MB, English, 8 voices,
+    Apache-2.0) — smallest viable English TTS, sub-real-time on M-series
+  - **Piper voices**, ~20 MB each: en_US-lessac, en_US-amy,
+    en_US-libritts_r (904 voices), es_ES, fr_FR, de_DE, hi_IN, pt_BR,
+    zh_CN, it_IT, ru_RU, ar_JO, tr_TR, nl_NL — MIT licensed
+  - **Kokoro v1.0 multilingual int8** (~126 MB) — 9 languages
+    (en/zh/ja/ko/es/fr/hi/it/pt) with 53 voices, opt-in for users who
+    prefer one-download-fits-all over per-language Piper voices
+  - **Kokoro en v0.19 int8** (~99 MB) — English HQ alternative with 11
+    voices and the best prosody in the catalog
+- **Region-strict language matching** — `pt-PT` cannot silently route to
+  a Brazilian voice. Mismatches surface as actionable errors.
+- **Sentence-aware text chunking** via `Intl.Segmenter`, with a word-window
+  fallback. Locked regression cases for `Dr. Smith`, `e.g.`, `v2.0`,
+  `U.S.A.`, URLs, and decimal numbers — none break sentence boundaries.
+
+### New — Cloud TTS (Deepgram REST `/v1/speak`)
+
+- 12 Aura voices surfaced in the picker (asteria, luna, stella, athena,
+  hera, orion, arcas, perseus, angus, orpheus, helios, zeus). Custom
+  Aura-2 voice ids that aren't in the catalog are accepted on faith and
+  validated server-side.
+- Reuses the existing `DEEPGRAM_API_KEY` configured for STT — one key
+  drives both directions of the voice loop.
+- Response size guarded at 75 MB (~26 minutes of 24 kHz PCM) to defend
+  against runaway error pages or misconfigured accounts.
+- Streaming WebSocket TTS (`wss://api.deepgram.com/v1/speak`) is gated
+  behind `ttsDeepgramStreaming` for v6.1.
+
+### New — Slash commands
+
+- `/voice-speak <text>` — synthesize and play
+- `/voice-speak-stop` — abort in-flight playback
+- `/voice-speak-toggle` — flip `ttsEnabled`
+- `/voice-speak-test` — synthesize "The quick brown fox..."
+
+### New — Settings panel "Speak" tab
+
+- Toggle TTS enabled, swap backend (Local ↔ Deepgram), cycle speed
+  (0.5x → 2.0x), and run a test synthesis from inside `/voice-settings`.
+- Voice selection in v6.0 is by editing config (`ttsLocalVoiceId` numeric
+  for local, `ttsDeepgramVoiceId` string for Deepgram). Inline picker
+  comes in v6.1.
+
+### Architecture
+
+- New `voice/sherpa-loader.ts` extracted from `sherpa-engine.ts` so STT
+  and TTS share a single-flight native module load via `??=`.
+- New modules: `voice/tts-local-models.ts` (catalog + install pipeline),
+  `voice/tts-engine.ts` (sherpa OfflineTts wrapper), `voice/tts-deepgram.ts`
+  (REST client), `voice/tts-playback.ts` (cross-platform audio spawn),
+  `voice/speak.ts` (orchestrator with backend dispatch).
+- Audio playback uses argument-array spawn (no shell) on all platforms;
+  Windows passes the WAV path via `$env:PI_SPEAK_PATH` so single quotes
+  in TMPDIR can't inject. Files are written `0600` and unlinked in a
+  single-ownership `finally` block. `AbortSignal` plumbed through
+  Node's native spawn signal option for atomic mid-playback cancellation.
+- TTS instance cache uses a single `Map<key, CachedTts | Promise<CachedTts>>`
+  keyed by `cacheKey(modelId, modelDir)` — no cross-key races, no
+  multi-field lockstep. Per-instance generate serialization via a
+  `generateChain` promise prevents overlapping audio from concurrent
+  `synthesize()` calls.
+
+### Configuration schema (additive)
+
+- `ttsEnabled` (bool, default false)
+- `ttsBackend` ("local" | "deepgram", default "local")
+- `ttsLocalModel` (string, default "kitten-nano-en-v0_2")
+- `ttsLocalVoiceId` (number, type-validated at load)
+- `ttsDeepgramVoiceId` (string, type-validated at load)
+- `ttsSpeed` (number, clamped 0.5–2.0)
+- `ttsAutoSpeak` (bool, reserved for v6.1)
+- `ttsLanguage` (BCP-47 string, optional)
+- `ttsDeepgramStreaming` (bool, v6.1 feature flag)
+
+Existing v5 configs load unchanged with TTS disabled.
+
+### Verification
+
+- `bunx tsc -p tsconfig.json --noEmit` clean against pi-coding-agent 0.70.5
+- `bun test` 130/130 passing (51 new TTS tests covering catalog shape,
+  Deepgram URL/voice/language validation, sentence chunking regression
+  cases, WAV encoder edge cases including NaN/Infinity, and abort
+  signaling)
+- Module-load smoke (mock pi): all 9 commands register, lifecycle handlers
+  fire cleanly, gates behave as documented
+- Real `pi 0.70.5` RPC smoke: extension loads, voice status updates emit
+- godspeed multi-model review run on every step (Steps 0-9, plus full-bundle
+  release gate). Many noise-floor false positives on the engine's
+  concurrency code consistently advisor-cleared as INVALID by Opus 4.7
+  (advisor confirms: Node single-threaded, run-to-completion). Substantive
+  reviewers (security, runtime, sonnet, moonshot, glm) consistently
+  SHIP'd.
+
+### Known gaps for v6.1
+
+- Streaming local playback (currently temp-WAV + spawn — adds ~50-100ms
+  latency over a streaming pipe)
+- `ttsAutoSpeak` hook firing after each assistant turn (the config field
+  exists but is unwired in v6.0 — manual `/voice-speak <text>` is the
+  primary entry point)
+- Inline voice picker in the Speak tab (v6.0 ships read-only display)
+
 ## [5.1.0] - 2026-04-28
 
 ### Changed (Settings panel UX overhaul)
@@ -323,6 +436,7 @@ single source of truth per row.
 - VAD pre-filtering
 - Pompom/Lumo creature companion (now separate package)
 
+[6.0.0]: https://github.com/codexstar69/pi-listen/releases/tag/v6.0.0
 [5.1.0]: https://github.com/codexstar69/pi-listen/releases/tag/v5.1.0
 [5.0.9]: https://github.com/codexstar69/pi-listen/releases/tag/v5.0.9
 [5.0.8]: https://github.com/codexstar69/pi-listen/releases/tag/v5.0.8

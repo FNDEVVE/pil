@@ -27,12 +27,13 @@ import { getFreeDiskSpace, formatBytes, getModelsDir, scanHandyModels, importHan
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-const TAB_IDS = ["general", "models", "downloaded", "device"] as const;
-const TAB_LABELS = ["General", "Models", "Downloaded", "Device"];
+const TAB_IDS = ["general", "models", "downloaded", "speak", "device"] as const;
+const TAB_LABELS = ["General", "Models", "Downloaded", "Speak", "Device"];
 type TabId = (typeof TAB_IDS)[number];
 
 export type PanelAction =
 	| { type: "download"; modelId: string }
+	| { type: "speak-test" }
 	| undefined;
 
 export interface PanelDeps {
@@ -168,6 +169,9 @@ export class VoiceSettingsPanel {
 				break;
 			case "downloaded":
 				lines.push(...this.renderDownloaded(w, iw).map(t));
+				break;
+			case "speak":
+				lines.push(...this.renderSpeak(w, iw).map(t));
 				break;
 			case "device":
 				lines.push(...this.renderDevice(w, iw).map(t));
@@ -496,6 +500,67 @@ export class VoiceSettingsPanel {
 		return lines;
 	}
 
+	// ─── Speak tab (TTS) ──────────────────────────────────────────────────
+
+	private renderSpeak(_w: number, _iw: number): string[] {
+		const lines: string[] = [];
+		const { config } = this.p;
+		const isLocal = (config.ttsBackend ?? "local") === "local";
+
+		// Five rows mirroring the General tab pattern:
+		//   0: Enabled toggle
+		//   1: Backend toggle
+		//   2: Voice (numeric sid for local; Deepgram model id otherwise)
+		//   3: Speed (cycles 0.5/1.0/1.25/1.5/2.0)
+		//   4: Test (synthesizes "The quick brown fox …")
+		const rows: { label: string; value: string; hint?: string }[] = [
+			{
+				label: "TTS",
+				value: config.ttsEnabled ? this.success("Enabled") : this.error("Disabled"),
+				hint: "toggle",
+			},
+			{
+				label: "Backend",
+				value: isLocal
+					? this.success("Local (offline, sherpa-onnx)")
+					: this.accent("Deepgram (cloud REST)"),
+				hint: "toggle",
+			},
+			{
+				label: "Voice",
+				value: isLocal
+					? `sid ${typeof config.ttsLocalVoiceId === "number" ? config.ttsLocalVoiceId : 0}`
+						+ ` (${config.ttsLocalModel ?? "kitten-nano-en-v0_2"})`
+					: (config.ttsDeepgramVoiceId ?? "aura-asteria-en"),
+				hint: "edit in settings.json",
+			},
+			{
+				label: "Speed",
+				value: `${(config.ttsSpeed ?? 1.0).toFixed(2)}x`,
+				hint: "cycle",
+			},
+			{
+				label: "Test",
+				value: this.dim("synthesize sample sentence"),
+				hint: "speak now",
+			},
+		];
+
+		const labelW = 12;
+		for (let i = 0; i < rows.length; i++) {
+			const r = rows[i]!;
+			const prefix = i === this.row ? this.accent("  → ") : "    ";
+			const label = r.label.padEnd(labelW);
+			const hint = (i === this.row && r.hint) ? this.dim(` [↵ ${r.hint}]`) : "";
+			lines.push(`${prefix}${label}${r.value}${hint}`);
+		}
+
+		lines.push("");
+		lines.push(this.dim("  ↵ change  ←→/Tab tabs  ↑↓ navigate  esc close"));
+		lines.push(this.dim("  TTS quickstart: /voice-speak <text>  ·  /voice-speak-stop"));
+		return lines;
+	}
+
 	// ─── Device tab ───────────────────────────────────────────────────────
 
 	private renderDevice(_w: number, _iw: number): string[] {
@@ -689,6 +754,38 @@ export class VoiceSettingsPanel {
 					if (result.ok) this.activateModel(h.piModelId);
 				}
 			}
+		} else if (tabId === "speak") {
+			const { config } = this.p;
+			switch (this.row) {
+				case 0: // TTS Enabled toggle
+					config.ttsEnabled = !config.ttsEnabled;
+					this.save();
+					break;
+				case 1: // Backend toggle
+					config.ttsBackend = (config.ttsBackend ?? "local") === "local" ? "deepgram" : "local";
+					this.save();
+					break;
+				case 2: // Voice — v6.0 ships read-only with edit-in-config hint
+					// In v6.1 this opens an inline picker; for now the
+					// recommended path is /voice-settings → close → edit
+					// settings.json directly.
+					break;
+				case 3: { // Speed cycle
+					const ladder = [0.75, 1.0, 1.25, 1.5, 2.0, 0.5];
+					const current = config.ttsSpeed ?? 1.0;
+					const idx = ladder.findIndex(v => Math.abs(v - current) < 0.01);
+					config.ttsSpeed = ladder[(idx + 1) % ladder.length];
+					this.save();
+					break;
+				}
+				case 4: { // Test — emit a special panel-close action so the
+					// caller (voice.ts:openSettingsPanel) can route it to
+					// /voice-speak-test without us depending on the
+					// command registry from inside the panel.
+					this.onClose?.({ type: "speak-test" } as PanelAction);
+					return;
+				}
+			}
 		}
 	}
 
@@ -768,6 +865,7 @@ export class VoiceSettingsPanel {
 				const handy = scanHandyModels().filter(h => !h.imported).length;
 				return dl + handy;
 			}
+			case "speak": return 5;
 			case "device": return 0;
 		}
 	}

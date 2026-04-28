@@ -39,6 +39,48 @@ export interface VoiceConfig {
 	localEndpoint?: string;
 	/** Global-only shortcut used to toggle recording without hold-to-talk */
 	toggleShortcut?: string;
+
+	// ─── TTS (text-to-speech) ─────────────────────────────────────────
+	// All TTS fields are opt-in (default: TTS disabled). New in v6.0.0.
+
+	/** Master TTS toggle. When false, /voice-speak is a no-op. */
+	ttsEnabled?: boolean;
+	/** "local" (sherpa-onnx, offline) or "deepgram" (cloud REST). */
+	ttsBackend?: "local" | "deepgram";
+	/** Active local TTS model id (e.g. "kitten-nano-en-v0_2"). */
+	ttsLocalModel?: string;
+	/**
+	 * Local backend speaker id (numeric `sid` per the model's voice
+	 * catalog). Type-validated at config load — strings get rejected and
+	 * fall back to the model's defaultSid.
+	 */
+	ttsLocalVoiceId?: number;
+	/**
+	 * Deepgram backend voice id (e.g. "aura-asteria-en"). Type-validated
+	 * at config load — numbers get rejected and fall back to
+	 * "aura-asteria-en".
+	 */
+	ttsDeepgramVoiceId?: string;
+	/** Speech rate multiplier; range 0.5–2.0. Default 1.0. */
+	ttsSpeed?: number;
+	/**
+	 * If true, the agent's responses are spoken automatically after each
+	 * turn. v6.0 ships with this defaulting OFF; manual /voice-speak is
+	 * the primary entry point. Auto-speak hook in v6.1.
+	 */
+	ttsAutoSpeak?: boolean;
+	/**
+	 * BCP-47 language tag for TTS (overrides `language`). Useful when
+	 * STT and TTS should use different languages — e.g. user dictates in
+	 * English but wants Spanish read-back.
+	 */
+	ttsLanguage?: string;
+	/**
+	 * v6.1 feature flag — opt-in WebSocket streaming for sub-200ms TTFB
+	 * on the Deepgram backend. v6.0 ships REST only; this is documented
+	 * but ignored.
+	 */
+	ttsDeepgramStreaming?: boolean;
 }
 
 export interface LoadedVoiceConfig {
@@ -62,6 +104,16 @@ export const DEFAULT_CONFIG: VoiceConfig = {
 	localModel: undefined,
 	localEndpoint: undefined,
 	toggleShortcut: "ctrl+shift+v",
+	// TTS defaults — all opt-in
+	ttsEnabled: false,
+	ttsBackend: "local",
+	ttsLocalModel: "kitten-nano-en-v0_2",
+	ttsLocalVoiceId: 0,
+	ttsDeepgramVoiceId: "aura-asteria-en",
+	ttsSpeed: 1.0,
+	ttsAutoSpeak: false,
+	ttsLanguage: undefined,
+	ttsDeepgramStreaming: false,
 	onboarding: {
 		completed: false,
 		schemaVersion: VOICE_CONFIG_VERSION,
@@ -121,6 +173,32 @@ function migrateConfig(rawVoice: any, source: VoiceConfigSource): VoiceConfig {
 		toggleShortcut: source !== "project" && typeof rawVoice.toggleShortcut === "string"
 			? rawVoice.toggleShortcut
 			: DEFAULT_CONFIG.toggleShortcut,
+		// TTS fields — type-validated; mismatched persisted values fall
+		// back to safe defaults so a hand-edited config can't poison the
+		// engine. Notably: ttsLocalVoiceId rejects strings (would crash
+		// sherpa's numeric sid arg) and ttsDeepgramVoiceId rejects numbers
+		// (would 4xx at the Deepgram REST layer).
+		ttsEnabled: typeof rawVoice.ttsEnabled === "boolean" ? rawVoice.ttsEnabled : DEFAULT_CONFIG.ttsEnabled,
+		ttsBackend: rawVoice.ttsBackend === "deepgram" ? "deepgram" : DEFAULT_CONFIG.ttsBackend,
+		ttsLocalModel: typeof rawVoice.ttsLocalModel === "string" && rawVoice.ttsLocalModel
+			? rawVoice.ttsLocalModel
+			: DEFAULT_CONFIG.ttsLocalModel,
+		ttsLocalVoiceId: typeof rawVoice.ttsLocalVoiceId === "number" && Number.isFinite(rawVoice.ttsLocalVoiceId)
+			? rawVoice.ttsLocalVoiceId
+			: DEFAULT_CONFIG.ttsLocalVoiceId,
+		ttsDeepgramVoiceId: typeof rawVoice.ttsDeepgramVoiceId === "string" && rawVoice.ttsDeepgramVoiceId
+			? rawVoice.ttsDeepgramVoiceId
+			: DEFAULT_CONFIG.ttsDeepgramVoiceId,
+		ttsSpeed: typeof rawVoice.ttsSpeed === "number" && Number.isFinite(rawVoice.ttsSpeed)
+			? Math.max(0.5, Math.min(2.0, rawVoice.ttsSpeed))
+			: DEFAULT_CONFIG.ttsSpeed,
+		ttsAutoSpeak: typeof rawVoice.ttsAutoSpeak === "boolean" ? rawVoice.ttsAutoSpeak : DEFAULT_CONFIG.ttsAutoSpeak,
+		ttsLanguage: typeof rawVoice.ttsLanguage === "string" && rawVoice.ttsLanguage
+			? rawVoice.ttsLanguage
+			: undefined,
+		ttsDeepgramStreaming: typeof rawVoice.ttsDeepgramStreaming === "boolean"
+			? rawVoice.ttsDeepgramStreaming
+			: DEFAULT_CONFIG.ttsDeepgramStreaming,
 		onboarding: normalizeOnboarding(rawVoice.onboarding, fallbackCompleted),
 	};
 }

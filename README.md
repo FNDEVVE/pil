@@ -12,15 +12,14 @@
 [![license](https://img.shields.io/npm/l/@codexstar/pi-listen.svg)](https://github.com/codexstar69/pi-listen/blob/main/LICENSE)
 [![author](https://img.shields.io/badge/author-@baanditeagle-1DA1F2?logo=x&logoColor=white)](https://x.com/baanditeagle)
 
-> **v5.1.0 — Cleaner settings panel, model selection grouped by family** —
-> the Models tab now organizes 19 models into Top picks / Parakeet / Whisper
-> / Moonshine / Specialist sections with short subtitles, single-cell status,
-> right-aligned sizes, and inline language coverage hints. Two-step delete
-> confirmation on the Downloaded tab so a stray keypress can't nuke a 2 GB
-> Whisper Large download. The panel now uses your Pi theme's accent /
-> success / warning colors instead of raw ANSI. Plus performance: Parakeet
-> TDT transcription 30-50% faster on Apple Silicon Pro/Max from v5.0.9.
-> [Full changelog →](CHANGELOG.md)
+> **v6.0.0 — TTS! pi-listen now speaks back** — voice in + voice out in one
+> extension. Hold-to-talk STT unchanged; new `/voice-speak <text>` synthesizes
+> and plays via 12 local models (Kitten Nano 25 MB default, Piper per-language
+> voices, Kokoro multilingual) or Deepgram Aura (cloud, same `DEEPGRAM_API_KEY`
+> as STT). Region-strict language matching, sentence-aware chunking via
+> `Intl.Segmenter` (no more breaking on `Dr. Smith` / `v2.0` / URLs),
+> cross-platform audio playback with cooperative abort. Plus the cleaner
+> v5.1 settings panel grouped by model family. [Full changelog →](CHANGELOG.md)
 
 ---
 

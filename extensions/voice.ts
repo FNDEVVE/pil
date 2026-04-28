@@ -2321,6 +2321,17 @@ export default function (pi: ExtensionAPI) {
 			},
 		);
 
+		// Post-close: handle the speak-test action by re-using the
+		// /voice-speak-test command path. We do this AFTER the panel has
+		// closed so the test sample plays without the picker overlay
+		// interfering with the audio cue (Pi's terminal renderer paints
+		// the panel as an overlay; closing it first gives a clean
+		// playback experience).
+		if (result?.type === "speak-test") {
+			await runSpeak(cmdCtx, "The quick brown fox jumps over the lazy dog.", { forceEnabled: true });
+			return;
+		}
+
 		// Post-close: handle download action with full pre-checks + progress
 		if (result?.type === "download" && result.modelId) {
 			const model = LOCAL_MODELS.find(m => m.id === result.modelId);
@@ -2428,6 +2439,120 @@ export default function (pi: ExtensionAPI) {
 		else { voiceCleanup(); }
 		updateVoiceStatus();
 	}
+
+	// ─── TTS commands (v6.0.0+) ─────────────────────────────────────────
+	//
+	// The active speech AbortController lives at extension scope so
+	// `/voice-speak-stop` can cancel whatever is currently playing.
+	// Re-entrant `/voice-speak` calls abort the prior one before starting
+	// (no overlapping audio); `null` means nothing is in-flight.
+	let activeSpeak: AbortController | null = null;
+
+	function abortActiveSpeak(): boolean {
+		if (!activeSpeak) return false;
+		try { activeSpeak.abort(); } catch {}
+		activeSpeak = null;
+		return true;
+	}
+
+	async function runSpeak(cmdCtx: ExtensionCommandContext, text: string, opts: { forceEnabled?: boolean } = {}): Promise<void> {
+		// `forceEnabled` lets /voice-speak-test bypass the gate without
+		// mutating shared config. The previous mutate-snapshot-restore
+		// pattern raced against /voice-speak-toggle and could clobber the
+		// user's explicit toggle.
+		if (!config.ttsEnabled && !opts.forceEnabled) {
+			cmdCtx.ui.notify("TTS is disabled. Enable in /voice-settings.", "warning");
+			return;
+		}
+		if (voiceState === "recording" || voiceState === "finalizing") {
+			// Speaking while the mic is hot would feedback into STT.
+			cmdCtx.ui.notify("Cannot speak while recording. Stop recording first.", "warning");
+			return;
+		}
+
+		// Cancel any in-flight speech so the new request takes the floor.
+		abortActiveSpeak();
+		const controller = new AbortController();
+		activeSpeak = controller;
+
+		try {
+			const { speak } = await import("./voice/speak");
+			const { getInstalledTtsModelDir, ensureTtsModelInstalled } = await import("./voice/tts-local-models");
+
+			// On the local backend, fetch the model on-demand if missing.
+			// Deepgram backend skips this branch entirely.
+			if ((config.ttsBackend ?? "local") === "local") {
+				const modelId = config.ttsLocalModel || "kitten-nano-en-v0_2";
+				try {
+					getInstalledTtsModelDir(modelId);
+				} catch {
+					cmdCtx.ui.notify(`Downloading TTS model ${modelId}…`, "info");
+					await ensureTtsModelInstalled(modelId, { signal: controller.signal });
+					cmdCtx.ui.notify(`TTS model ${modelId} ready.`, "info");
+				}
+			}
+
+			await speak({
+				text,
+				config,
+				signal: controller.signal,
+				resolveModelDir: (id) => getInstalledTtsModelDir(id),
+			});
+		} catch (err: any) {
+			if (err?.name === "AbortError") return;
+			cmdCtx.ui.notify(`Speak failed: ${err?.message ?? err}`, "error");
+		} finally {
+			if (activeSpeak === controller) activeSpeak = null;
+		}
+	}
+
+	pi.registerCommand("voice-speak", {
+		description: "Speak the given text (text-to-speech)",
+		handler: async (args, cmdCtx) => {
+			ctx = cmdCtx;
+			const text = (args || "").trim();
+			if (!text) {
+				cmdCtx.ui.notify("Usage: /voice-speak <text>", "warning");
+				return;
+			}
+			await runSpeak(cmdCtx, text);
+		},
+	});
+
+	pi.registerCommand("voice-speak-stop", {
+		description: "Stop in-flight TTS playback",
+		handler: async (_args, cmdCtx) => {
+			ctx = cmdCtx;
+			if (abortActiveSpeak()) {
+				cmdCtx.ui.notify("Speech stopped.", "info");
+			} else {
+				cmdCtx.ui.notify("No active speech.", "info");
+			}
+		},
+	});
+
+	pi.registerCommand("voice-speak-toggle", {
+		description: "Toggle TTS on/off (master switch)",
+		handler: async (_args, cmdCtx) => {
+			ctx = cmdCtx;
+			config.ttsEnabled = !config.ttsEnabled;
+			saveConfig(config, config.scope === "project" ? "project" : "global", currentCwd);
+			if (!config.ttsEnabled) abortActiveSpeak();
+			cmdCtx.ui.notify(`TTS ${config.ttsEnabled ? "enabled" : "disabled"}.`, "info");
+		},
+	});
+
+	pi.registerCommand("voice-speak-test", {
+		description: "Synthesize a sample sentence in the current voice",
+		handler: async (_args, cmdCtx) => {
+			ctx = cmdCtx;
+			// Pass forceEnabled so the test runs even when ttsEnabled is
+			// false — without mutating shared config (a concurrent
+			// /voice-speak-toggle would otherwise be clobbered when the
+			// test's finally restored its snapshot).
+			await runSpeak(cmdCtx, "The quick brown fox jumps over the lazy dog.", { forceEnabled: true });
+		},
+	});
 
 	// ─── /voice-settings — unified pi-listen settings panel ─────────────
 

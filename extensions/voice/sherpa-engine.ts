@@ -19,27 +19,14 @@
  */
 
 import * as path from "node:path";
-import * as fs from "node:fs";
 import * as os from "node:os";
 import type { LocalModelInfo } from "./local";
+import { loadSherpa, getSherpaModule, getSherpaError, isSherpaAvailable } from "./sherpa-loader";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 /** sherpa-onnx recognizer — opaque handle from the native module */
 type SherpaRecognizer = any;
-
-/** sherpa-onnx module — dynamically imported */
-let sherpaModule: any = null;
-let sherpaInitialized = false;
-let sherpaError: string | null = null;
-
-/**
- * Promise cache for in-flight initialization. Concurrent callers (e.g. one
- * voice command and one settings-panel diagnostic firing within the same
- * tick) all await the same promise instead of each running platform checks
- * and dynamically importing the native module independently.
- */
-let initPromise: Promise<boolean> | null = null;
 
 /** Cached recognizer for the currently loaded model + language */
 let cachedRecognizer: { modelId: string; language: string; recognizer: SherpaRecognizer } | null = null;
@@ -47,80 +34,18 @@ let cachedRecognizer: { modelId: string; language: string; recognizer: SherpaRec
 // ─── Initialization ──────────────────────────────────────────────────────────
 
 /**
- * Initialize the sherpa-onnx module.
- * Must be called once before any transcription.
- *
- * Checks platform compatibility (ARM32, musl) then loads
- * the sherpa-onnx-node module.
- *
- * Concurrency contract: JavaScript is single-threaded with run-to-completion
- * semantics, so there is no preemption window between the `sherpaInitialized`
- * check, the `initPromise ??= …` claim, and the synchronous start of the
- * async body in `doInitSherpa()`. A second caller arriving on a later
- * microtask sees a non-null `initPromise` and awaits the same in-flight
- * promise. After the promise settles, `sherpaInitialized` is true, so every
- * subsequent caller takes the synchronous fast-path. There is no race window
- * where two concurrent callers can both enter the platform-check / dynamic-
- * import path.
+ * Initialize the sherpa-onnx module. Kept as a thin alias around `loadSherpa()`
+ * so existing call sites (extension lifecycle, settings panel, /voice test)
+ * continue to compile and behave identically. New code should call
+ * `loadSherpa()` directly.
  */
 export async function initSherpa(): Promise<boolean> {
-	if (sherpaInitialized) return !sherpaError;
-	// `??=` is a single expression: assign-if-nullish. It claims the slot
-	// before yielding, so two concurrent callers cannot both enter doInitSherpa.
-	initPromise ??= doInitSherpa();
-	return initPromise;
+	return loadSherpa();
 }
 
-async function doInitSherpa(): Promise<boolean> {
-	try {
-		// Early platform checks — fail fast with clear messages
-		if (process.arch === "arm") {
-			throw new Error("ARM32 (armv7l) is not supported by sherpa-onnx-node. Use 64-bit OS or the Deepgram cloud backend.");
-		}
-		if (process.platform === "linux") {
-			try {
-				const ldd = fs.readFileSync("/usr/bin/ldd", "utf-8");
-				if (ldd.includes("musl")) {
-					throw new Error("Alpine Linux (musl libc) is not supported by sherpa-onnx-node. Use a glibc-based distribution or the Deepgram cloud backend.");
-				}
-			} catch (e: any) {
-				if (e?.message?.includes("musl")) throw e;
-				// /usr/bin/ldd not readable — not Alpine, continue
-			}
-		}
-
-		// Note: LD_LIBRARY_PATH/DYLD_LIBRARY_PATH set at runtime have no effect on dlopen().
-		// The native .node binary uses $ORIGIN/@loader_path to find sibling .so/.dylib files,
-		// so library resolution works without env var manipulation.
-
-		sherpaModule = await import("sherpa-onnx-node");
-		sherpaInitialized = true;
-		return true;
-	} catch (err: any) {
-		sherpaError = err?.message || String(err);
-		sherpaInitialized = true;
-		return false;
-	} finally {
-		// Drop the in-flight reference once the promise settles. From here on
-		// the synchronous `sherpaInitialized` fast-path at the top of initSherpa
-		// serves every caller — keeping the resolved promise around is dead
-		// weight. Setting to null in the finally is safe because every code
-		// path through the try/catch sets `sherpaInitialized = true` before
-		// reaching here, so any later caller will fast-path and never read
-		// the now-null `initPromise`.
-		initPromise = null;
-	}
-}
-
-/** Get the sherpa initialization error, if any. */
-export function getSherpaError(): string | null {
-	return sherpaError;
-}
-
-/** Check if sherpa-onnx is available. */
-export function isSherpaAvailable(): boolean {
-	return sherpaInitialized && !sherpaError && sherpaModule != null;
-}
+// Re-export the loader's status helpers so STT call sites that imported them
+// from `./sherpa-engine` keep working.
+export { getSherpaError, isSherpaAvailable };
 
 // ─── Recognizer management ──────────────────────────────────────────────────
 
@@ -129,7 +54,10 @@ export function isSherpaAvailable(): boolean {
  * Returns a cached instance if the model hasn't changed.
  */
 export function getOrCreateRecognizer(model: LocalModelInfo, modelDir: string, language: string): SherpaRecognizer {
-	if (!sherpaModule) throw new Error("sherpa-onnx not initialized. Call initSherpa() first.");
+	// getSherpaModule() throws if loadSherpa() hasn't run yet — same contract as
+	// the previous "if (!sherpaModule) throw" check, but routed through the
+	// shared loader so STT and TTS share the single-flight init.
+	getSherpaModule();
 
 	// Strip regional suffix for local models (e.g. "pt-BR" → "pt")
 	const baseLang = language.split("-")[0] || language;
@@ -172,7 +100,8 @@ export function clearRecognizerCache(): void {
  * @returns Transcribed text
  */
 export async function transcribeBuffer(pcmData: Buffer, recognizer: SherpaRecognizer): Promise<string> {
-	if (!sherpaModule) throw new Error("sherpa-onnx not initialized");
+	// Throws if loadSherpa() hasn't run; callers always call initSherpa first.
+	getSherpaModule();
 
 	// Convert 16-bit PCM to Float32Array (sherpa expects float samples in [-1, 1])
 	const samples = pcmToFloat32(pcmData);
@@ -213,7 +142,8 @@ function createRecognizer(model: LocalModelInfo, modelDir: string, language: str
 // Verified against: nodejs-addon-examples/test_asr_non_streaming_whisper.js
 function createWhisperRecognizer(model: LocalModelInfo, modelDir: string, language: string): SherpaRecognizer {
 	const files = model.sherpaModel!.files;
-	return new sherpaModule.OfflineRecognizer({
+	const sherpa = getSherpaModule();
+	return new sherpa.OfflineRecognizer({
 		featConfig: {
 			sampleRate: 16000,
 			featureDim: 80,
@@ -253,7 +183,8 @@ function createMoonshineRecognizer(model: LocalModelInfo, modelDir: string): She
 		moonshineConfig.cachedDecoder = path.join(modelDir, files.cachedDecoder!);
 	}
 
-	return new sherpaModule.OfflineRecognizer({
+	const sherpa = getSherpaModule();
+	return new sherpa.OfflineRecognizer({
 		featConfig: {
 			sampleRate: 16000,
 			featureDim: 80,
@@ -270,7 +201,8 @@ function createMoonshineRecognizer(model: LocalModelInfo, modelDir: string): She
 // Verified against: nodejs-addon-examples/test_asr_non_streaming_sense_voice.js
 function createSenseVoiceRecognizer(model: LocalModelInfo, modelDir: string, language: string): SherpaRecognizer {
 	const files = model.sherpaModel!.files;
-	return new sherpaModule.OfflineRecognizer({
+	const sherpa = getSherpaModule();
+	return new sherpa.OfflineRecognizer({
 		featConfig: {
 			sampleRate: 16000,
 			featureDim: 80,
@@ -291,7 +223,8 @@ function createSenseVoiceRecognizer(model: LocalModelInfo, modelDir: string, lan
 // Verified against: nodejs-addon-examples/test_asr_non_streaming_nemo_ctc.js
 function createNemoCtcRecognizer(model: LocalModelInfo, modelDir: string): SherpaRecognizer {
 	const files = model.sherpaModel!.files;
-	return new sherpaModule.OfflineRecognizer({
+	const sherpa = getSherpaModule();
+	return new sherpa.OfflineRecognizer({
 		featConfig: {
 			sampleRate: 16000,
 			featureDim: 80,
@@ -320,7 +253,8 @@ function createNemoCtcRecognizer(model: LocalModelInfo, modelDir: string): Sherp
 //     https://k2-fsa.github.io/sherpa/onnx/pretrained_models/offline-transducer/nemo-transducer-models.html.
 function createTransducerRecognizer(model: LocalModelInfo, modelDir: string): SherpaRecognizer {
 	const files = model.sherpaModel!.files;
-	return new sherpaModule.OfflineRecognizer({
+	const sherpa = getSherpaModule();
+	return new sherpa.OfflineRecognizer({
 		featConfig: {
 			sampleRate: 16000,
 			featureDim: 80,
