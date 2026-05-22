@@ -48,6 +48,30 @@ describe("DEEPGRAM_TTS_VOICES catalog", () => {
 		}
 	});
 
+	test("surfaces legacy Aura voices below Aura-2 voices", () => {
+		const ids = new Set(DEEPGRAM_TTS_VOICES.map(v => v.id));
+		for (const id of [
+			"aura-asteria-en",
+			"aura-luna-en",
+			"aura-stella-en",
+			"aura-athena-en",
+			"aura-hera-en",
+			"aura-orion-en",
+			"aura-arcas-en",
+			"aura-perseus-en",
+			"aura-angus-en",
+			"aura-orpheus-en",
+			"aura-helios-en",
+			"aura-zeus-en",
+		]) {
+			expect(ids.has(id)).toBe(true);
+		}
+
+		const firstLegacyAuraIndex = DEEPGRAM_TTS_VOICES.findIndex(v => v.id.startsWith("aura-") && !v.id.startsWith("aura-2-"));
+		const lastAura2Index = DEEPGRAM_TTS_VOICES.findLastIndex(v => v.id.startsWith("aura-2-"));
+		expect(firstLegacyAuraIndex).toBeGreaterThan(lastAura2Index);
+	});
+
 	test("every voice has language and gender", () => {
 		for (const v of DEEPGRAM_TTS_VOICES) {
 			expect(v.language).toBeDefined();
